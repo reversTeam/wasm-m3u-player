@@ -48,6 +48,8 @@ features = [
     "EncodedAudioChunkInit",
     "EncodedAudioChunkType",
     "AudioData",
+    "AudioDataCopyToOptions",
+    "AudioSampleFormat",
     # Web Audio
     "AudioContext",
     "AudioBuffer",
