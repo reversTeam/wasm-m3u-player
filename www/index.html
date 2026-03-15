@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WASM Video Player — Test Page</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <h1>WASM Video Player</h1>
+
+        <div class="url-bar">
+            <input type="text" id="url-input" placeholder="Enter video URL (MP4, MKV, WebM)..." />
+            <button id="load-btn">Load</button>
+        </div>
+
+        <div class="player-container">
+            <canvas id="video-canvas"></canvas>
+        </div>
+
+        <div class="controls">
+            <button id="play-btn" disabled>Play</button>
+            <button id="pause-btn" disabled>Pause</button>
+            <button id="stop-btn" disabled>Stop</button>
+            <div class="timeline">
+                <input type="range" id="seek-bar" min="0" max="100" value="0" disabled />
+                <span id="time-display">0:00 / 0:00</span>
+            </div>
+        </div>
+
+        <div id="status-bar">Status: Idle</div>
+        <div id="error-display" class="hidden"></div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>
