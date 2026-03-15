@@ -5,5 +5,5 @@ pub mod mkv;
 
 pub use types::*;
 pub use detect::*;
-pub use self::mp4::Mp4Demuxer;
+pub use self::mp4::{Mp4Demuxer, Mp4Box, MoovLocation};
 pub use self::mkv::MkvDemuxer;

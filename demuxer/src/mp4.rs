@@ -10,6 +10,38 @@ pub struct Mp4Demuxer {
     sample_cursors: Vec<(u32, u32)>,
 }
 
+/// A top-level MP4 box found during scanning.
+#[derive(Debug, Clone)]
+pub struct Mp4Box {
+    /// 4-char box type (e.g. "ftyp", "moov", "mdat").
+    pub box_type: [u8; 4],
+    /// Byte offset of the box start in the file.
+    pub offset: u64,
+    /// Total box size (header + content). 0 if extends to EOF.
+    pub size: u64,
+}
+
+impl Mp4Box {
+    pub fn type_str(&self) -> &str {
+        std::str::from_utf8(&self.box_type).unwrap_or("????")
+    }
+    pub fn is_type(&self, t: &[u8; 4]) -> bool {
+        &self.box_type == t
+    }
+}
+
+/// Result of scanning for moov box position.
+#[derive(Debug)]
+pub enum MoovLocation {
+    /// moov was found in the scanned data — normal streaming works.
+    Found { offset: u64, size: u64 },
+    /// mdat found before moov — moov is likely at end of file.
+    /// Includes the mdat offset+size and the expected moov offset.
+    AtEnd { moov_offset: u64 },
+    /// Not enough data to determine (no mdat or moov found yet).
+    Unknown,
+}
+
 impl Mp4Demuxer {
     pub fn new() -> Self {
         Self {
@@ -17,6 +49,88 @@ impl Mp4Demuxer {
             media_info: None,
             sample_cursors: Vec::new(),
         }
+    }
+
+    /// Scan top-level MP4 boxes from raw data without parsing their content.
+    /// Each box has an 8-byte header: [4 bytes size][4 bytes type].
+    /// If size == 1, an extended 64-bit size follows (8 more bytes).
+    /// If size == 0, the box extends to EOF.
+    pub fn scan_top_level_boxes(data: &[u8]) -> Vec<Mp4Box> {
+        let mut boxes = Vec::new();
+        let mut pos: u64 = 0;
+        let len = data.len() as u64;
+
+        while pos + 8 <= len {
+            let i = pos as usize;
+            let size_u32 = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+            let box_type: [u8; 4] = [data[i + 4], data[i + 5], data[i + 6], data[i + 7]];
+
+            let size: u64 = if size_u32 == 1 {
+                // Extended size (64-bit) follows the type
+                if pos + 16 > len {
+                    break; // Not enough data for extended header
+                }
+                let ext = &data[(i + 8)..(i + 16)];
+                u64::from_be_bytes([ext[0], ext[1], ext[2], ext[3], ext[4], ext[5], ext[6], ext[7]])
+            } else if size_u32 == 0 {
+                // Box extends to EOF
+                0
+            } else {
+                size_u32 as u64
+            };
+
+            boxes.push(Mp4Box {
+                box_type,
+                offset: pos,
+                size,
+            });
+
+            // Advance to next box
+            if size == 0 {
+                break; // Rest of file is this box
+            }
+            pos += size;
+        }
+
+        boxes
+    }
+
+    /// Determine where the moov box is located.
+    /// Call this with the first few KB of data to decide if Range request is needed.
+    pub fn locate_moov(data: &[u8], file_size: u64) -> MoovLocation {
+        let boxes = Self::scan_top_level_boxes(data);
+        let mut found_mdat = false;
+        let mut mdat_end: u64 = 0;
+
+        for b in &boxes {
+            if b.is_type(b"moov") {
+                return MoovLocation::Found {
+                    offset: b.offset,
+                    size: b.size,
+                };
+            }
+            if b.is_type(b"mdat") {
+                found_mdat = true;
+                if b.size > 0 {
+                    mdat_end = b.offset + b.size;
+                } else {
+                    // mdat extends to EOF — moov must be before it (already found) or absent
+                    return MoovLocation::Unknown;
+                }
+            }
+        }
+
+        if found_mdat && mdat_end > 0 {
+            // mdat found without moov — moov is at mdat_end (or later)
+            // If mdat_end >= file_size, something is wrong
+            if mdat_end < file_size {
+                return MoovLocation::AtEnd {
+                    moov_offset: mdat_end,
+                };
+            }
+        }
+
+        MoovLocation::Unknown
     }
 
     /// Build a WebCodecs-compatible codec string from MP4 track info.

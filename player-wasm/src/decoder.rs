@@ -136,6 +136,14 @@ impl VideoDecoderWrapper {
         self.frame_queue.borrow().len()
     }
 
+    /// Drain all decoded frames from the queue without closing the decoder.
+    /// Used during seek to clear stale frames.
+    pub fn flush_queue(&self) {
+        for frame in self.frame_queue.borrow_mut().drain(..) {
+            frame.close();
+        }
+    }
+
     /// Flush the decoder (wait for all pending frames).
     pub async fn flush(&self) -> Result<(), JsValue> {
         if let Some(decoder) = &self.decoder {

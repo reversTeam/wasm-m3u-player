@@ -5,7 +5,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
-use demuxer::{detect_format, ContainerFormat, Demuxer, EncodedChunk, MkvDemuxer, Mp4Demuxer};
+use demuxer::{detect_format, ContainerFormat, Demuxer, EncodedChunk, MkvDemuxer, MoovLocation, Mp4Demuxer};
 use m3u_core::{parse as parse_m3u, Playlist};
 use player_core::{MediaInfo, PlaybackStatus, PlayerEvent, PlayerState};
 
@@ -47,9 +47,21 @@ pub struct Player {
     /// Data length at last demux session (avoid re-demuxing same data).
     last_demux_data_len: usize,
 
+    /// URL of the current media (kept for Range requests during seek).
+    current_url: Option<String>,
+    /// Whether the server supports HTTP Range requests.
+    server_supports_range: bool,
+    /// For moov-at-end MP4: we prepend ftyp+moov to the download buffer.
+    /// The demuxer sees a virtual buffer where sample offsets still work
+    /// because we keep the full ftyp+moov+mdat assembly.
+    /// This is the size of the header prefix (ftyp+moov) prepended before mdat data.
+    header_prefix_len: usize,
+
     // --- Playback timing ---
     /// `performance.now()` at the moment play() is called.
     playback_start_time: f64,
+    /// Status before seek started (to restore after).
+    pre_seek_status: Option<PlaybackStatus>,
 
     // --- Playlist ---
     playlist: Option<Playlist>,
@@ -78,7 +90,11 @@ impl Player {
             mp4_cursors: None,
             mkv_frames_read: 0,
             last_demux_data_len: 0,
+            current_url: None,
+            server_supports_range: false,
+            header_prefix_len: 0,
             playback_start_time: 0.0,
+            pre_seek_status: None,
             playlist: None,
             playlist_index: 0,
         })
@@ -109,9 +125,10 @@ impl Player {
     /// This method:
     /// 1. Opens a streaming HTTP connection
     /// 2. Reads data until the container header can be parsed
-    /// 3. Configures decoders
-    /// 4. Spawns a background task for the remaining download
-    /// 5. Returns — caller should then call `play()` and start a `render_tick()` loop
+    /// 3. For MP4 with moov-at-end: uses Range request to fetch moov first
+    /// 4. Configures decoders
+    /// 5. Spawns a background task for the remaining download
+    /// 6. Returns — caller should then call `play()` and start a `render_tick()` loop
     pub async fn load(&mut self, url: String) -> Result<(), JsValue> {
         self.state.status = PlaybackStatus::Loading;
         self.emit_event(&PlayerEvent::StatusChanged {
@@ -125,18 +142,24 @@ impl Player {
         self.mp4_cursors = None;
         self.mkv_frames_read = 0;
         self.last_demux_data_len = 0;
+        self.header_prefix_len = 0;
+        self.current_url = Some(url.clone());
 
         // Open streaming connection
         let stream = StreamReader::open(&url).await?;
+        self.server_supports_range = stream.supports_range;
+        let file_size = stream.content_length;
         {
             let mut dl = self.download.borrow_mut();
-            dl.content_length = stream.content_length;
-            if stream.content_length > 0 {
-                dl.data.reserve(stream.content_length as usize);
+            dl.content_length = file_size;
+            if file_size > 0 {
+                dl.data.reserve(file_size as usize);
             }
         }
 
-        // Read chunks until header can be parsed
+        // Read initial chunks — enough to probe format and scan boxes
+        // We read at least 64KB or until header parses or stream ends
+        let mut moov_check_done = false;
         loop {
             match stream.read_chunk().await? {
                 Some(chunk_data) => {
@@ -146,20 +169,52 @@ impl Player {
                     }
                     self.emit_download_progress();
 
+                    // First try normal header parsing (works for moov-first MP4, MKV, WebM)
                     if self.try_parse_header()? {
                         break;
+                    }
+
+                    // After accumulating some data, check for moov-at-end (MP4 only)
+                    let data_len = self.download.borrow().data.len();
+                    if !moov_check_done && data_len >= 32768 && file_size > 0 {
+                        moov_check_done = true;
+                        let data = self.download.borrow().data.clone();
+
+                        // Only for MP4 files
+                        if data.len() >= 8 && &data[4..8] == b"ftyp" {
+                            match Mp4Demuxer::locate_moov(&data, file_size) {
+                                MoovLocation::AtEnd { moov_offset } => {
+                                    // moov is at the end — try Range request
+                                    if self.try_fetch_moov_at_end(
+                                        &url, moov_offset, file_size, &data,
+                                    ).await? {
+                                        break; // Header parsed via moov-at-end path
+                                    }
+                                    // If Range fetch failed, continue linear download
+                                }
+                                MoovLocation::Found { .. } => {
+                                    // moov is in our data but parse_header failed
+                                    // (maybe incomplete moov) — continue downloading
+                                }
+                                MoovLocation::Unknown => {
+                                    // Can't tell yet — continue
+                                }
+                            }
+                        }
                     }
                 }
                 None => {
                     self.download.borrow_mut().complete = true;
                     if !self.header_parsed {
-                        self.state.status = PlaybackStatus::Error;
-                        return Err(JsValue::from_str(
-                            "Download complete but container header could not be parsed",
-                        ));
+                        // Last attempt to parse with all data
+                        if !self.try_parse_header()? {
+                            self.state.status = PlaybackStatus::Error;
+                            return Err(JsValue::from_str(
+                                "Download complete but container header could not be parsed",
+                            ));
+                        }
                     }
-                    // Entire file downloaded during header parsing
-                    return Ok(());
+                    break;
                 }
             }
         }
@@ -207,8 +262,14 @@ impl Player {
     pub fn render_tick(&mut self) -> bool {
         if self.state.status != PlaybackStatus::Playing
             && self.state.status != PlaybackStatus::Buffering
+            && self.state.status != PlaybackStatus::Seeking
         {
             return false;
+        }
+
+        // Don't render during seek — just keep the loop alive
+        if self.state.status == PlaybackStatus::Seeking {
+            return true;
         }
 
         // 1. Demux more chunks if queue is low
@@ -357,9 +418,69 @@ impl Player {
     }
 
     /// Seek to a position in milliseconds.
-    pub async fn seek(&mut self, _time_ms: u64) -> Result<(), JsValue> {
-        // TODO: implement seeking
-        Err(JsValue::from_str("Seeking not yet implemented"))
+    ///
+    /// 1. Flush decoders (clear pending frames)
+    /// 2. Clear chunk queue
+    /// 3. Re-create demuxer from current data, seek to nearest keyframe
+    /// 4. Re-demux a batch of chunks from the seek point
+    /// 5. Resynchronize the A/V clock
+    pub async fn seek(&mut self, time_ms: u64) -> Result<(), JsValue> {
+        if !self.header_parsed {
+            return Err(JsValue::from_str("Cannot seek before media is loaded"));
+        }
+
+        // Save pre-seek status to restore after
+        let was_playing = self.state.status == PlaybackStatus::Playing
+            || self.state.status == PlaybackStatus::Buffering;
+        self.pre_seek_status = Some(self.state.status);
+
+        self.state.status = PlaybackStatus::Seeking;
+        self.emit_event(&PlayerEvent::StatusChanged {
+            status: PlaybackStatus::Seeking,
+        });
+        self.emit_event(&PlayerEvent::Seeking { target_ms: time_ms });
+
+        // 1. Clear chunk queue
+        self.chunk_queue.clear();
+
+        // 2. Flush decoders — drain all pending frames
+        self.video_decoder.flush_queue();
+        self.audio_pipeline.flush_queue();
+
+        // 3. Re-create demuxer and seek to keyframe
+        let timestamp_us = (time_ms as i64) * 1000;
+        let actual_ms = self.seek_demuxer(timestamp_us)?;
+
+        // 4. Re-demux a batch from the new position
+        self.try_demux_more();
+
+        // 5. Resynchronize clock
+        let actual_time_ms = actual_ms as f64;
+        self.av_sync.reset();
+        self.av_sync.set_start_offset(actual_time_ms);
+        if self.audio_pipeline.is_configured() {
+            self.audio_pipeline.reset_schedule();
+        }
+        self.playback_start_time = now_ms();
+        self.state.current_time_ms = actual_ms as u64;
+
+        // 6. Restore status
+        let new_status = if was_playing {
+            PlaybackStatus::Playing
+        } else {
+            PlaybackStatus::Paused
+        };
+        self.state.status = new_status;
+        self.pre_seek_status = None;
+
+        self.emit_event(&PlayerEvent::Seeked {
+            actual_ms: actual_ms as u64,
+        });
+        self.emit_event(&PlayerEvent::StatusChanged {
+            status: new_status,
+        });
+
+        Ok(())
     }
 
     /// Load an M3U playlist from a URL, then load the first track.
@@ -462,6 +583,10 @@ impl Player {
         self.mp4_cursors = None;
         self.mkv_frames_read = 0;
         self.last_demux_data_len = 0;
+        self.current_url = None;
+        self.server_supports_range = false;
+        self.header_prefix_len = 0;
+        self.pre_seek_status = None;
     }
 }
 
@@ -476,6 +601,90 @@ impl Player {
                 let _ = callback.call1(&JsValue::NULL, &js_event);
             }
         }
+    }
+
+    /// Fetch the moov box from the end of an MP4 file via Range request.
+    /// Assembles ftyp + moov into the download buffer so parse_header can work.
+    /// Returns true if header was successfully parsed.
+    async fn try_fetch_moov_at_end(
+        &mut self,
+        url: &str,
+        moov_offset: u64,
+        file_size: u64,
+        initial_data: &[u8],
+    ) -> Result<bool, JsValue> {
+        // Fetch from moov_offset to end of file
+        let moov_data = StreamReader::fetch_range(url, moov_offset, file_size - 1).await?;
+
+        if moov_data.is_empty() {
+            return Ok(false);
+        }
+
+        // Extract ftyp box from the initial data
+        let boxes = Mp4Demuxer::scan_top_level_boxes(initial_data);
+        let ftyp_box = boxes.iter().find(|b| b.is_type(b"ftyp"));
+
+        // Build a virtual buffer: ftyp + moov
+        // The mp4 crate needs both to parse the header.
+        // We'll then rebuild the full buffer as ftyp+moov+mdat-data for demuxing.
+        let mut header_buf = Vec::new();
+
+        if let Some(ftyp) = ftyp_box {
+            let end = if ftyp.size > 0 {
+                (ftyp.offset + ftyp.size) as usize
+            } else {
+                initial_data.len()
+            };
+            let start = ftyp.offset as usize;
+            if end <= initial_data.len() {
+                header_buf.extend_from_slice(&initial_data[start..end]);
+            }
+        }
+
+        // Append the moov data
+        header_buf.extend_from_slice(&moov_data);
+        let header_prefix_len = header_buf.len();
+
+        // Try to parse the header from ftyp+moov
+        let format = detect_format(&header_buf);
+        if format != ContainerFormat::Mp4 {
+            return Ok(false);
+        }
+
+        // For the mp4 crate to work correctly with sample reading,
+        // we need the full file structure. Strategy: replace the download buffer
+        // with header_buf (ftyp+moov) + the mdat data we already have from streaming.
+        // The sample offsets in stbl point to absolute positions in the original file,
+        // so we need to present the data at the right offsets.
+        //
+        // Simplest approach: put the FULL initial data + moov_data into the download buffer.
+        // The mp4 crate reads from a Cursor, so having extra data is fine.
+        {
+            let mut dl = self.download.borrow_mut();
+            // Append the moov data to whatever we've downloaded so far
+            // Since we're still streaming linearly, the download buffer has data[0..N]
+            // and moov is at file[moov_offset..file_size].
+            // We extend to include the moov at the correct position.
+            // If our buffer is shorter than moov_offset, fill with zeros.
+            let current_len = dl.data.len();
+            if (current_len as u64) < file_size {
+                dl.data.resize(file_size as usize, 0);
+            }
+            // Copy moov data at the correct offset
+            let dest_start = moov_offset as usize;
+            let dest_end = dest_start + moov_data.len();
+            if dest_end <= dl.data.len() {
+                dl.data[dest_start..dest_end].copy_from_slice(&moov_data);
+            }
+        }
+
+        // Now try parsing the header — the buffer has ftyp at start and moov at moov_offset
+        if self.try_parse_header()? {
+            self.header_prefix_len = header_prefix_len;
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     /// Emit a download progress event from current SharedDownload state.
@@ -675,6 +884,57 @@ impl Player {
         self.last_demux_data_len = data_len;
     }
 
+    /// Seek the demuxer to the nearest keyframe before `timestamp_us`.
+    /// Returns the actual timestamp in ms that was seeked to.
+    fn seek_demuxer(&mut self, timestamp_us: i64) -> Result<f64, JsValue> {
+        let format = self.demuxer_format.ok_or_else(|| {
+            JsValue::from_str("No demuxer format set")
+        })?;
+
+        let data = self.download.borrow().data.clone();
+
+        match format {
+            ContainerFormat::Mp4 => {
+                let mut demuxer = Mp4Demuxer::new();
+                demuxer.parse_header(&data).map_err(|e| {
+                    JsValue::from_str(&format!("Seek: MP4 parse error: {}", e))
+                })?;
+
+                demuxer.seek_to_keyframe(timestamp_us).map_err(|e| {
+                    JsValue::from_str(&format!("Seek error: {}", e))
+                })?;
+
+                // Save the new cursor positions for try_demux_more
+                self.mp4_cursors = Some(demuxer.sample_positions());
+                self.last_demux_data_len = 0; // Force re-demux
+            }
+            ContainerFormat::Mkv | ContainerFormat::WebM => {
+                // MKV: re-parse and skip to approximate position
+                // seek_to_keyframe is not implemented for MKV yet,
+                // so we use skip_frames as a rough approximation
+                let mut demuxer = MkvDemuxer::new();
+                demuxer.parse_header(&data).map_err(|e| {
+                    JsValue::from_str(&format!("Seek: MKV parse error: {}", e))
+                })?;
+
+                // Estimate frame position from timestamp
+                // This is a rough heuristic — proper MKV seek needs Cues parsing
+                demuxer.seek_to_keyframe(timestamp_us).map_err(|e| {
+                    JsValue::from_str(&format!("MKV seek error: {}", e))
+                })?;
+
+                self.mkv_frames_read = demuxer.frames_read();
+                self.last_demux_data_len = 0;
+            }
+            _ => {
+                return Err(JsValue::from_str("Unsupported format for seek"));
+            }
+        }
+
+        // Return the target time in ms (actual keyframe time may differ slightly)
+        Ok(timestamp_us as f64 / 1000.0)
+    }
+
     /// Get the current master clock in milliseconds.
     /// Uses AudioContext.currentTime when audio is available,
     /// falls back to performance.now() offset.
@@ -792,6 +1052,8 @@ impl Player {
         self.mp4_cursors = None;
         self.mkv_frames_read = 0;
         self.last_demux_data_len = 0;
+        self.header_prefix_len = 0;
+        self.pre_seek_status = None;
         self.state.current_time_ms = 0;
         self.state.has_video = false;
         self.state.has_audio = false;

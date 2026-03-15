@@ -118,19 +118,22 @@ function handlePlayerEvent(event) {
                     break;
                 case 'Ready':
                     hideOverlay();
-                    setControlsEnabled(true, false, true, false);
+                    setControlsEnabled(true, false, true, true);
                     break;
                 case 'Playing':
                     hideOverlay();
-                    setControlsEnabled(false, true, true, false);
+                    setControlsEnabled(false, true, true, true);
                     break;
                 case 'Paused':
                     stopRenderLoop();
-                    setControlsEnabled(true, false, true, false);
+                    setControlsEnabled(true, false, true, true);
                     break;
                 case 'Buffering':
                     showOverlay('Buffering...');
-                    setControlsEnabled(false, true, true, false);
+                    setControlsEnabled(false, true, true, true);
+                    break;
+                case 'Seeking':
+                    showOverlay('Seeking...');
                     break;
                 case 'Stopped':
                     stopRenderLoop();
@@ -198,6 +201,17 @@ function handlePlayerEvent(event) {
 
         case 'PlaylistTrackChanged':
             updatePlaylistUI(event.index);
+            break;
+
+        case 'Seeking':
+            showOverlay(`Seeking to ${formatTime(event.target_ms)}...`);
+            break;
+
+        case 'Seeked':
+            hideOverlay();
+            if (event.actual_ms != null) {
+                timeCurrent.textContent = formatTime(event.actual_ms);
+            }
             break;
 
         case 'BufferUpdate':
@@ -318,6 +332,38 @@ function stop() {
     stopRenderLoop();
     player.stop();
 }
+
+// --- Seek ---
+let isSeeking = false;
+
+seekBar.addEventListener('input', () => {
+    // While dragging, update the time display but don't seek yet
+    if (!player) return;
+    const state = player.get_state();
+    if (state?.duration_ms) {
+        const targetMs = Math.round((seekBar.value / 1000) * state.duration_ms);
+        timeCurrent.textContent = formatTime(targetMs);
+    }
+});
+
+seekBar.addEventListener('change', async () => {
+    if (!player || isSeeking) return;
+    const state = player.get_state();
+    if (!state?.duration_ms) return;
+
+    const targetMs = Math.round((seekBar.value / 1000) * state.duration_ms);
+    isSeeking = true;
+    try {
+        await player.seek(targetMs);
+        // Restart render loop if we were playing
+        if (state.status === 'Playing' || state.status === 'Buffering') {
+            startRenderLoop();
+        }
+    } catch (e) {
+        showError(`Seek failed: ${e}`);
+    }
+    isSeeking = false;
+});
 
 // --- Bind Events ---
 loadBtn.addEventListener('click', loadMedia);

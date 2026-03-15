@@ -115,6 +115,22 @@ impl AudioPipeline {
         Ok(())
     }
 
+    /// Drain all decoded audio data from the queue without closing the decoder.
+    /// Used during seek to clear stale audio.
+    pub fn flush_queue(&self) {
+        for data in self.data_queue.borrow_mut().drain(..) {
+            data.close();
+        }
+    }
+
+    /// Reset the audio scheduling time to the current AudioContext time.
+    /// Called after seek to avoid scheduling audio in the past.
+    pub fn reset_schedule(&mut self) {
+        if let Some(ctx) = &self.audio_ctx {
+            self.next_play_time = ctx.current_time();
+        }
+    }
+
     /// Schedule decoded audio data for playback via AudioBufferSourceNode.
     /// Should be called regularly (e.g. each rAF) to drain the queue.
     pub fn pump_audio(&mut self) -> Result<(), JsValue> {
