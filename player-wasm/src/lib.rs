@@ -5,6 +5,7 @@ pub mod renderer;
 pub mod fetch;
 pub mod audio;
 pub mod sync;
+pub mod player;
 
 /// Initialize the WASM module (sets up panic hook for better error messages).
 #[wasm_bindgen(start)]
