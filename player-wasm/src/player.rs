@@ -22,6 +22,12 @@ use crate::sync::{AVSync, SyncAction};
 /// **Streaming architecture**: download happens in the background via `spawn_local`.
 /// Data flows into a `SharedDownload` buffer. The `render_tick()` method, called by
 /// JS `requestAnimationFrame`, progressively demuxes, decodes, and renders frames.
+///
+/// **Non-faststart MP4**: When the moov box is at the end of the file (common for
+/// non-faststart MP4), a Range request fetches it early. A synthetic buffer is built
+/// for demuxing: `[original bytes 0..N] + [modified mdat header] + [moov]`. Sample
+/// offsets (stco/co64) in moov point to absolute file positions, which match our
+/// download buffer since it starts at byte 0 of the original file.
 #[wasm_bindgen]
 pub struct Player {
     renderer: CanvasRenderer,
@@ -51,14 +57,20 @@ pub struct Player {
     current_url: Option<String>,
     /// Whether the server supports HTTP Range requests.
     server_supports_range: bool,
-    /// For moov-at-end MP4: we prepend ftyp+moov to the download buffer.
-    /// The demuxer sees a virtual buffer where sample offsets still work
-    /// because we keep the full ftyp+moov+mdat assembly.
-    /// This is the size of the header prefix (ftyp+moov) prepended before mdat data.
-    header_prefix_len: usize,
+
+    // --- Non-faststart MP4 support ---
+    /// moov box data fetched via Range request (for moov-at-end MP4).
+    /// When Some, `build_demux_buffer()` builds a synthetic buffer for the mp4 crate.
+    moov_data: Option<Vec<u8>>,
+    /// Byte offset of the mdat box in the original file.
+    mdat_offset: usize,
+    /// Size of the mdat box header (8 or 16 bytes).
+    mdat_header_size: usize,
 
     // --- Playback timing ---
-    /// `performance.now()` at the moment play() is called.
+    /// `performance.now()` at the moment play() is called, adjusted for seek.
+    /// Clock = now_ms() - playback_start_time. After seek to T ms,
+    /// playback_start_time = now_ms() - T so clock starts at T.
     playback_start_time: f64,
     /// Status before seek started (to restore after).
     pre_seek_status: Option<PlaybackStatus>,
@@ -92,7 +104,9 @@ impl Player {
             last_demux_data_len: 0,
             current_url: None,
             server_supports_range: false,
-            header_prefix_len: 0,
+            moov_data: None,
+            mdat_offset: 0,
+            mdat_header_size: 0,
             playback_start_time: 0.0,
             pre_seek_status: None,
             playlist: None,
@@ -142,7 +156,9 @@ impl Player {
         self.mp4_cursors = None;
         self.mkv_frames_read = 0;
         self.last_demux_data_len = 0;
-        self.header_prefix_len = 0;
+        self.moov_data = None;
+        self.mdat_offset = 0;
+        self.mdat_header_size = 0;
         self.current_url = Some(url.clone());
 
         // Open streaming connection
@@ -152,13 +168,15 @@ impl Player {
         {
             let mut dl = self.download.borrow_mut();
             dl.content_length = file_size;
+            // Reserve up to 256MB upfront; beyond that, let Vec grow on demand
+            // to avoid capacity overflow in WASM with multi-GB files
             if file_size > 0 {
-                dl.data.reserve(file_size as usize);
+                let reserve = (file_size as usize).min(256 * 1024 * 1024);
+                dl.data.reserve(reserve);
             }
         }
 
         // Read initial chunks — enough to probe format and scan boxes
-        // We read at least 64KB or until header parses or stream ends
         let mut moov_check_done = false;
         loop {
             match stream.read_chunk().await? {
@@ -452,16 +470,21 @@ impl Player {
         let actual_ms = self.seek_demuxer(timestamp_us)?;
 
         // 4. Re-demux a batch from the new position
+        self.last_demux_data_len = 0; // Force re-demux
         self.try_demux_more();
 
         // 5. Resynchronize clock
-        let actual_time_ms = actual_ms as f64;
+        // Set playback_start_time so that clock_ms() returns actual_ms right now.
+        // clock_ms = now_ms() - playback_start_time
+        // We want clock_ms = actual_ms at this instant.
+        // So: playback_start_time = now_ms() - actual_ms
+        self.playback_start_time = now_ms() - actual_ms;
         self.av_sync.reset();
-        self.av_sync.set_start_offset(actual_time_ms);
+        // offset = 0: clock already accounts for seek position
+        self.av_sync.set_start_offset(0.0);
         if self.audio_pipeline.is_configured() {
             self.audio_pipeline.reset_schedule();
         }
-        self.playback_start_time = now_ms();
         self.state.current_time_ms = actual_ms as u64;
 
         // 6. Restore status
@@ -585,7 +608,9 @@ impl Player {
         self.last_demux_data_len = 0;
         self.current_url = None;
         self.server_supports_range = false;
-        self.header_prefix_len = 0;
+        self.moov_data = None;
+        self.mdat_offset = 0;
+        self.mdat_header_size = 0;
         self.pre_seek_status = None;
     }
 }
@@ -604,7 +629,12 @@ impl Player {
     }
 
     /// Fetch the moov box from the end of an MP4 file via Range request.
-    /// Assembles ftyp + moov into the download buffer so parse_header can work.
+    ///
+    /// For non-faststart MP4 files (moov after mdat), we:
+    /// 1. Fetch moov via Range request and store it in `self.moov_data`
+    /// 2. Record mdat box position/header size
+    /// 3. Build a synthetic buffer (ftyp + modified-mdat + moov) to parse the header
+    ///
     /// Returns true if header was successfully parsed.
     async fn try_fetch_moov_at_end(
         &mut self,
@@ -620,71 +650,117 @@ impl Player {
             return Ok(false);
         }
 
-        // Extract ftyp box from the initial data
+        // Scan top-level boxes to find mdat position and header size
         let boxes = Mp4Demuxer::scan_top_level_boxes(initial_data);
-        let ftyp_box = boxes.iter().find(|b| b.is_type(b"ftyp"));
+        let mdat_box = boxes.iter().find(|b| b.is_type(b"mdat"));
 
-        // Build a virtual buffer: ftyp + moov
-        // The mp4 crate needs both to parse the header.
-        // We'll then rebuild the full buffer as ftyp+moov+mdat-data for demuxing.
-        let mut header_buf = Vec::new();
-
-        if let Some(ftyp) = ftyp_box {
-            let end = if ftyp.size > 0 {
-                (ftyp.offset + ftyp.size) as usize
+        if let Some(mdat) = mdat_box {
+            self.mdat_offset = mdat.offset as usize;
+            // Header size: 8 normally, 16 for extended (size == 1 in first 4 bytes)
+            let i = mdat.offset as usize;
+            if i + 4 <= initial_data.len() {
+                let size_u32 = u32::from_be_bytes([
+                    initial_data[i],
+                    initial_data[i + 1],
+                    initial_data[i + 2],
+                    initial_data[i + 3],
+                ]);
+                self.mdat_header_size = if size_u32 == 1 { 16 } else { 8 };
             } else {
-                initial_data.len()
-            };
-            let start = ftyp.offset as usize;
-            if end <= initial_data.len() {
-                header_buf.extend_from_slice(&initial_data[start..end]);
+                self.mdat_header_size = 8;
             }
         }
 
-        // Append the moov data
-        header_buf.extend_from_slice(&moov_data);
-        let header_prefix_len = header_buf.len();
+        // Store moov data for synthetic buffer building
+        self.moov_data = Some(moov_data);
 
-        // Try to parse the header from ftyp+moov
-        let format = detect_format(&header_buf);
-        if format != ContainerFormat::Mp4 {
+        // Build synthetic buffer and try to parse header
+        let synthetic = self.build_demux_buffer();
+        if synthetic.is_empty() {
+            self.moov_data = None;
             return Ok(false);
         }
 
-        // For the mp4 crate to work correctly with sample reading,
-        // we need the full file structure. Strategy: replace the download buffer
-        // with header_buf (ftyp+moov) + the mdat data we already have from streaming.
-        // The sample offsets in stbl point to absolute positions in the original file,
-        // so we need to present the data at the right offsets.
-        //
-        // Simplest approach: put the FULL initial data + moov_data into the download buffer.
-        // The mp4 crate reads from a Cursor, so having extra data is fine.
-        {
-            let mut dl = self.download.borrow_mut();
-            // Append the moov data to whatever we've downloaded so far
-            // Since we're still streaming linearly, the download buffer has data[0..N]
-            // and moov is at file[moov_offset..file_size].
-            // We extend to include the moov at the correct position.
-            // If our buffer is shorter than moov_offset, fill with zeros.
-            let current_len = dl.data.len();
-            if (current_len as u64) < file_size {
-                dl.data.resize(file_size as usize, 0);
-            }
-            // Copy moov data at the correct offset
-            let dest_start = moov_offset as usize;
-            let dest_end = dest_start + moov_data.len();
-            if dest_end <= dl.data.len() {
-                dl.data[dest_start..dest_end].copy_from_slice(&moov_data);
-            }
+        // Parse header from the synthetic buffer
+        let format = detect_format(&synthetic);
+        if format != ContainerFormat::Mp4 {
+            self.moov_data = None;
+            return Ok(false);
         }
 
-        // Now try parsing the header — the buffer has ftyp at start and moov at moov_offset
-        if self.try_parse_header()? {
-            self.header_prefix_len = header_prefix_len;
-            return Ok(true);
-        }
+        let mut demuxer = Mp4Demuxer::new();
+        let media_info = match demuxer.parse_header(&synthetic) {
+            Ok(info) => info,
+            Err(_) => {
+                self.moov_data = None;
+                return Ok(false);
+            }
+        };
 
-        Ok(false)
+        // Configure decoders (same as try_parse_header)
+        self.configure_decoders(&media_info)?;
+
+        self.header_parsed = true;
+        self.demuxer_format = Some(format);
+
+        Ok(true)
+    }
+
+    /// Build the buffer to pass to the mp4 demuxer.
+    ///
+    /// For non-faststart MP4 (moov_data is Some):
+    /// The download buffer is `[ftyp][mdat data (partial)]` — the mdat box header
+    /// claims a huge size (original file's mdat) but we only have partial data.
+    /// The mp4 crate needs moov to parse the header, and moov is at the end.
+    ///
+    /// Strategy: copy download data as-is (preserving all byte offsets), then
+    /// patch the mdat box header to claim only the downloaded size, and append
+    /// moov right after. This way:
+    /// - The mp4 crate scans boxes: ftyp → mdat(truncated) → moov ✓
+    /// - Sample offsets in stbl are absolute file positions → they point to the
+    ///   same bytes in our buffer because we didn't move anything ✓
+    /// - Samples beyond downloaded range: read_sample fails → next_chunk returns None ✓
+    ///
+    /// For faststart MP4 / MKV / WebM:
+    /// Returns a clone of the download buffer as-is.
+    fn build_demux_buffer(&self) -> Vec<u8> {
+        let dl = self.download.borrow();
+
+        if let Some(moov_data) = &self.moov_data {
+            let download_len = dl.data.len();
+
+            // Copy all downloaded data as-is (preserves absolute byte offsets)
+            let mut buf = Vec::with_capacity(download_len + moov_data.len());
+            buf.extend_from_slice(&dl.data);
+
+            // Patch the mdat box header in-place to claim the truncated size
+            // so the mp4 crate can skip past it and find moov after it
+            if self.mdat_offset + self.mdat_header_size <= download_len {
+                let new_mdat_total = (download_len - self.mdat_offset) as u64;
+                let i = self.mdat_offset;
+
+                if self.mdat_header_size == 16 {
+                    // Extended size: [1u32][mdat][size_u64]
+                    // size_u32 stays as 1, patch the u64 at offset+8
+                    if i + 16 <= buf.len() {
+                        buf[i + 8..i + 16].copy_from_slice(&new_mdat_total.to_be_bytes());
+                    }
+                } else {
+                    // Normal: [size_u32][mdat]
+                    if i + 4 <= buf.len() {
+                        buf[i..i + 4].copy_from_slice(&(new_mdat_total as u32).to_be_bytes());
+                    }
+                }
+            }
+
+            // Append moov right after — the mp4 crate finds it after scanning past mdat
+            buf.extend_from_slice(moov_data);
+
+            buf
+        } else {
+            // Normal case: download buffer already has the complete structure
+            dl.data.clone()
+        }
     }
 
     /// Emit a download progress event from current SharedDownload state.
@@ -699,48 +775,8 @@ impl Player {
         });
     }
 
-    /// Try to parse the container header from current download data.
-    /// Returns `true` if header was successfully parsed, `false` if more data is needed.
-    fn try_parse_header(&mut self) -> Result<bool, JsValue> {
-        if self.header_parsed {
-            return Ok(true);
-        }
-
-        let data = self.download.borrow().data.clone();
-
-        // Need at least 12 bytes to probe format
-        if data.len() < 12 {
-            return Ok(false);
-        }
-
-        let format = detect_format(&data);
-        if format == ContainerFormat::Unknown {
-            // Not enough data or truly unsupported — keep trying
-            return Ok(false);
-        }
-
-        // Try to parse the header with current data
-        let media_info = match format {
-            ContainerFormat::Mp4 => {
-                let mut demuxer = Mp4Demuxer::new();
-                match demuxer.parse_header(&data) {
-                    Ok(info) => info,
-                    Err(_) => return Ok(false), // Not enough data yet (e.g. moov at end)
-                }
-            }
-            ContainerFormat::Mkv | ContainerFormat::WebM => {
-                let mut demuxer = MkvDemuxer::new();
-                match demuxer.parse_header(&data) {
-                    Ok(info) => info,
-                    Err(_) => return Ok(false),
-                }
-            }
-            _ => {
-                self.state.status = PlaybackStatus::Error;
-                return Err(JsValue::from_str("Unsupported container format"));
-            }
-        };
-
+    /// Configure decoders from demuxer MediaInfo and emit events.
+    fn configure_decoders(&mut self, media_info: &demuxer::MediaInfo) -> Result<(), JsValue> {
         // Configure video decoder
         if let Some(video_track) = media_info.video_tracks.first() {
             self.video_decoder.configure(
@@ -801,13 +837,58 @@ impl Player {
         self.state.media_info = Some(player_info.clone());
         self.state.status = PlaybackStatus::Ready;
 
-        self.header_parsed = true;
-        self.demuxer_format = Some(format);
-
         self.emit_event(&PlayerEvent::MediaLoaded { info: player_info });
         self.emit_event(&PlayerEvent::StatusChanged {
             status: PlaybackStatus::Ready,
         });
+
+        Ok(())
+    }
+
+    /// Try to parse the container header from current download data.
+    /// Returns `true` if header was successfully parsed, `false` if more data is needed.
+    fn try_parse_header(&mut self) -> Result<bool, JsValue> {
+        if self.header_parsed {
+            return Ok(true);
+        }
+
+        let data = self.download.borrow().data.clone();
+
+        // Need at least 12 bytes to probe format
+        if data.len() < 12 {
+            return Ok(false);
+        }
+
+        let format = detect_format(&data);
+        if format == ContainerFormat::Unknown {
+            return Ok(false);
+        }
+
+        // Try to parse the header with current data
+        let media_info = match format {
+            ContainerFormat::Mp4 => {
+                let mut demuxer = Mp4Demuxer::new();
+                match demuxer.parse_header(&data) {
+                    Ok(info) => info,
+                    Err(_) => return Ok(false),
+                }
+            }
+            ContainerFormat::Mkv | ContainerFormat::WebM => {
+                let mut demuxer = MkvDemuxer::new();
+                match demuxer.parse_header(&data) {
+                    Ok(info) => info,
+                    Err(_) => return Ok(false),
+                }
+            }
+            _ => {
+                self.state.status = PlaybackStatus::Error;
+                return Err(JsValue::from_str("Unsupported container format"));
+            }
+        };
+
+        self.configure_decoders(&media_info)?;
+        self.header_parsed = true;
+        self.demuxer_format = Some(format);
 
         Ok(true)
     }
@@ -828,8 +909,8 @@ impl Player {
             None => return,
         };
 
-        // Clone current data snapshot
-        let data = self.download.borrow().data.clone();
+        // Build the appropriate buffer for the demuxer
+        let data = self.build_demux_buffer();
         let target = self.config.demux_batch_size;
         let mut count = 0;
 
@@ -891,7 +972,7 @@ impl Player {
             JsValue::from_str("No demuxer format set")
         })?;
 
-        let data = self.download.borrow().data.clone();
+        let data = self.build_demux_buffer();
 
         match format {
             ContainerFormat::Mp4 => {
@@ -906,25 +987,18 @@ impl Player {
 
                 // Save the new cursor positions for try_demux_more
                 self.mp4_cursors = Some(demuxer.sample_positions());
-                self.last_demux_data_len = 0; // Force re-demux
             }
             ContainerFormat::Mkv | ContainerFormat::WebM => {
-                // MKV: re-parse and skip to approximate position
-                // seek_to_keyframe is not implemented for MKV yet,
-                // so we use skip_frames as a rough approximation
                 let mut demuxer = MkvDemuxer::new();
                 demuxer.parse_header(&data).map_err(|e| {
                     JsValue::from_str(&format!("Seek: MKV parse error: {}", e))
                 })?;
 
-                // Estimate frame position from timestamp
-                // This is a rough heuristic — proper MKV seek needs Cues parsing
                 demuxer.seek_to_keyframe(timestamp_us).map_err(|e| {
                     JsValue::from_str(&format!("MKV seek error: {}", e))
                 })?;
 
                 self.mkv_frames_read = demuxer.frames_read();
-                self.last_demux_data_len = 0;
             }
             _ => {
                 return Err(JsValue::from_str("Unsupported format for seek"));
@@ -936,14 +1010,10 @@ impl Player {
     }
 
     /// Get the current master clock in milliseconds.
-    /// Uses AudioContext.currentTime when audio is available,
-    /// falls back to performance.now() offset.
+    /// Uses performance.now() offset from playback_start_time.
+    /// After seek to time T, playback_start_time is set so clock starts at T.
     fn clock_ms(&self) -> f64 {
-        if self.audio_pipeline.is_configured() {
-            self.audio_pipeline.current_time_ms()
-        } else {
-            now_ms() - self.playback_start_time
-        }
+        now_ms() - self.playback_start_time
     }
 
     /// Spawn a background task to continue downloading remaining data.
@@ -1052,7 +1122,9 @@ impl Player {
         self.mp4_cursors = None;
         self.mkv_frames_read = 0;
         self.last_demux_data_len = 0;
-        self.header_prefix_len = 0;
+        self.moov_data = None;
+        self.mdat_offset = 0;
+        self.mdat_header_size = 0;
         self.pre_seek_status = None;
         self.state.current_time_ms = 0;
         self.state.has_video = false;
