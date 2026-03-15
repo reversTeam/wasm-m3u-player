@@ -11,26 +11,42 @@
         <h1>WASM Video Player</h1>
 
         <div class="url-bar">
-            <input type="text" id="url-input" placeholder="Enter video URL (MP4, MKV, WebM)..." />
+            <input type="text" id="url-input" placeholder="Enter video or M3U playlist URL..." />
             <button id="load-btn">Load</button>
         </div>
 
         <div class="player-container">
-            <canvas id="video-canvas"></canvas>
+            <canvas id="video-canvas" width="640" height="360"></canvas>
+            <div id="overlay" class="overlay hidden">
+                <span id="overlay-text"></span>
+            </div>
         </div>
 
         <div class="controls">
-            <button id="play-btn" disabled>Play</button>
-            <button id="pause-btn" disabled>Pause</button>
-            <button id="stop-btn" disabled>Stop</button>
+            <div class="controls-row">
+                <button id="play-btn" disabled title="Play">&#9654;</button>
+                <button id="pause-btn" disabled title="Pause">&#9646;&#9646;</button>
+                <button id="stop-btn" disabled title="Stop">&#9632;</button>
+            </div>
             <div class="timeline">
-                <input type="range" id="seek-bar" min="0" max="100" value="0" disabled />
-                <span id="time-display">0:00 / 0:00</span>
+                <span id="time-current">0:00</span>
+                <input type="range" id="seek-bar" min="0" max="1000" value="0" step="1" disabled />
+                <span id="time-duration">0:00</span>
             </div>
         </div>
 
         <div id="status-bar">Status: Idle</div>
         <div id="error-display" class="hidden"></div>
+
+        <div id="media-info" class="hidden">
+            <h3>Media Info</h3>
+            <ul id="media-info-list"></ul>
+        </div>
+
+        <div id="playlist-panel" class="hidden">
+            <h3>Playlist</h3>
+            <ul id="playlist-list"></ul>
+        </div>
     </div>
 
     <script type="module" src="app.js"></script>
