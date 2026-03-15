@@ -18,9 +18,11 @@ const mediaInfoPanel = document.getElementById('media-info');
 const mediaInfoList = document.getElementById('media-info-list');
 const playlistPanel = document.getElementById('playlist-panel');
 const playlistList = document.getElementById('playlist-list');
+const downloadBar = document.getElementById('download-bar');
 
 let player = null;
 let rafId = null; // requestAnimationFrame handle
+let currentStatus = 'Idle'; // Track player status to avoid overlay conflicts
 
 // --- Helpers ---
 function formatTime(ms) {
@@ -107,6 +109,7 @@ function handlePlayerEvent(event) {
 
     switch (event.type) {
         case 'StatusChanged':
+            currentStatus = event.status;
             setStatus(event.status);
             switch (event.status) {
                 case 'Loading':
@@ -165,16 +168,22 @@ function handlePlayerEvent(event) {
         case 'DownloadProgress': {
             const received = event.received_bytes;
             const total = event.total_bytes;
-            if (total > 0) {
-                const pct = Math.round((received / total) * 100);
-                const mb = (received / 1048576).toFixed(1);
-                const totalMb = (total / 1048576).toFixed(1);
-                showOverlay(`Downloading... ${pct}% (${mb} / ${totalMb} MB)`);
-                setStatus(`Downloading: ${pct}%`);
-            } else {
-                const mb = (received / 1048576).toFixed(1);
-                showOverlay(`Downloading... ${mb} MB`);
-                setStatus(`Downloading: ${mb} MB`);
+            // Only show overlay during initial loading (before header is parsed).
+            // Once status moves to Ready/Playing/etc, show progress in status bar only.
+            if (currentStatus === 'Loading') {
+                if (total > 0) {
+                    const pct = Math.round((received / total) * 100);
+                    const mb = (received / 1048576).toFixed(1);
+                    const totalMb = (total / 1048576).toFixed(1);
+                    showOverlay(`Loading... ${pct}% (${mb} / ${totalMb} MB)`);
+                } else {
+                    const mb = (received / 1048576).toFixed(1);
+                    showOverlay(`Loading... ${mb} MB`);
+                }
+            }
+            // Always update the download bar if it exists
+            if (downloadBar && total > 0) {
+                downloadBar.style.width = `${Math.round((received / total) * 100)}%`;
             }
             break;
         }
@@ -192,7 +201,6 @@ function handlePlayerEvent(event) {
             break;
 
         case 'BufferUpdate':
-            // Could display buffer level in UI
             break;
 
         case 'Ended':
@@ -242,6 +250,9 @@ async function playTrack(index) {
     try {
         stopRenderLoop();
         await player.play_track(index);
+        // Auto-play after track load
+        await player.play();
+        startRenderLoop();
     } catch (e) {
         showError(`Track load failed: ${e}`);
     }
@@ -263,6 +274,7 @@ async function loadMedia() {
     try {
         player = new Player(canvas);
         player.on_event(handlePlayerEvent);
+        currentStatus = 'Loading';
         setStatus('Loading...');
         showOverlay('Loading...');
 
@@ -274,6 +286,10 @@ async function loadMedia() {
             playlistPanel.classList.add('hidden');
             await player.load(url);
         }
+
+        // Auto-play: start playback immediately after load
+        await player.play();
+        startRenderLoop();
     } catch (e) {
         showError(`Load failed: ${e}`);
         setStatus('Error');

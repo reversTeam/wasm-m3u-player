@@ -74,36 +74,51 @@ impl Mp4Demuxer {
         }
     }
 
-    /// Extract codec config bytes (SPS+PPS for H264).
+    /// Extract the full AVCDecoderConfigurationRecord for WebCodecs description.
+    ///
+    /// WebCodecs VideoDecoder.configure() requires the raw avcC record as
+    /// the `description` field — not just SPS/PPS bytes.
     fn extract_video_codec_config(mp4_track: &mp4::Mp4Track) -> Vec<u8> {
         if let Some(avc1) = mp4_track.trak.mdia.minf.stbl.stsd.avc1.as_ref() {
             let avcc = &avc1.avcc;
             let mut config = Vec::new();
 
+            // AVCDecoderConfigurationRecord header
+            config.push(avcc.configuration_version);
+            config.push(avcc.avc_profile_indication);
+            config.push(avcc.profile_compatibility);
+            config.push(avcc.avc_level_indication);
+            config.push(avcc.length_size_minus_one | 0xFC); // upper 6 bits reserved = 1
+
+            // SPS array
+            config.push(avcc.sequence_parameter_sets.len() as u8 | 0xE0); // upper 3 bits reserved = 1
             for sps in &avcc.sequence_parameter_sets {
                 config.extend_from_slice(&(sps.bytes.len() as u16).to_be_bytes());
                 config.extend_from_slice(&sps.bytes);
             }
+
+            // PPS array
+            config.push(avcc.picture_parameter_sets.len() as u8);
             for pps in &avcc.picture_parameter_sets {
                 config.extend_from_slice(&(pps.bytes.len() as u16).to_be_bytes());
                 config.extend_from_slice(&pps.bytes);
             }
+
             config
         } else {
             Vec::new()
         }
     }
 
+    /// Extract the AudioSpecificConfig (2 bytes) for WebCodecs AudioDecoder.
     fn extract_audio_codec_config(mp4_track: &mp4::Mp4Track) -> Vec<u8> {
         if let Some(mp4a) = mp4_track.trak.mdia.minf.stbl.stsd.mp4a.as_ref() {
             if let Some(esds) = &mp4a.esds {
-                return esds
-                    .es_desc
-                    .dec_config
-                    .dec_specific
-                    .profile
-                    .to_be_bytes()
-                    .to_vec();
+                let dsc = &esds.es_desc.dec_config.dec_specific;
+                // Rebuild the 2-byte AudioSpecificConfig from parsed fields
+                let byte_a = (dsc.profile << 3) | (dsc.freq_index >> 1);
+                let byte_b = (dsc.freq_index << 7) | (dsc.chan_conf << 3);
+                return vec![byte_a, byte_b];
             }
         }
         Vec::new()
