@@ -1,0 +1,12 @@
+[package]
+name = "demuxer"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-format video demuxer (MP4, MKV/WebM) for WASM"
+
+[lib]
+name = "demuxer"
+
+[dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }

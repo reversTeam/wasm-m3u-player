@@ -1,0 +1,12 @@
+[package]
+name = "m3u-core"
+version = "0.1.0"
+edition = "2021"
+description = "M3U playlist parser for video playlists"
+
+[lib]
+name = "m3u_core"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"

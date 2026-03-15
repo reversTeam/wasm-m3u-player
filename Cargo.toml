@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "m3u-core",
+    "demuxer",
+    "player-core",
+    "player-wasm",
+]
+resolver = "2"

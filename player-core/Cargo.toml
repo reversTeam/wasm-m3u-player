@@ -1,0 +1,12 @@
+[package]
+name = "player-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared types for the WASM video player (PlayerState, PlayerEvent, etc.)"
+
+[lib]
+name = "player_core"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
