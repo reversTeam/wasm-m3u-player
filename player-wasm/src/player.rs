@@ -2,6 +2,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
 use demuxer::{detect_format, ContainerFormat, Demuxer, Mp4Demuxer, MkvDemuxer};
+use m3u_core::{parse as parse_m3u, Playlist};
 use player_core::{MediaInfo, PlaybackStatus, PlayerEvent, PlayerState};
 
 use crate::audio::AudioPipeline;
@@ -24,6 +25,9 @@ pub struct Player {
     data_buffer: Option<Vec<u8>>,
     /// Demuxer state
     demuxer_format: Option<ContainerFormat>,
+    /// Playlist state
+    playlist: Option<Playlist>,
+    playlist_index: usize,
 }
 
 #[wasm_bindgen]
@@ -42,6 +46,8 @@ impl Player {
             event_callback: None,
             data_buffer: None,
             demuxer_format: None,
+            playlist: None,
+            playlist_index: 0,
         })
     }
 
@@ -202,6 +208,84 @@ impl Player {
         Err(JsValue::from_str("Seeking not yet implemented"))
     }
 
+    /// Load an M3U playlist from a URL, then load the first track.
+    pub async fn load_playlist(&mut self, url: String) -> Result<(), JsValue> {
+        self.state.status = PlaybackStatus::Loading;
+        self.emit_event(&PlayerEvent::StatusChanged {
+            status: PlaybackStatus::Loading,
+        });
+
+        // Fetch playlist text
+        let data = fetch_bytes(&url).await?;
+        let text = String::from_utf8(data)
+            .map_err(|_| JsValue::from_str("Playlist is not valid UTF-8"))?;
+
+        // Parse M3U
+        let playlist = parse_m3u(&text)
+            .map_err(|e| JsValue::from_str(&format!("M3U parse error: {}", e)))?;
+
+        if playlist.entries.is_empty() {
+            return Err(JsValue::from_str("Playlist has no entries"));
+        }
+
+        self.playlist = Some(playlist);
+        self.playlist_index = 0;
+
+        // Load the first track
+        self.load_current_track().await
+    }
+
+    /// Get the current playlist as a JS array of {url, title, duration_secs}.
+    pub fn get_playlist(&self) -> JsValue {
+        match &self.playlist {
+            Some(pl) => serde_wasm_bindgen::to_value(pl).unwrap_or(JsValue::NULL),
+            None => JsValue::NULL,
+        }
+    }
+
+    /// Get the current playlist track index.
+    pub fn get_playlist_index(&self) -> usize {
+        self.playlist_index
+    }
+
+    /// Skip to the next track in the playlist.
+    pub async fn next_track(&mut self) -> Result<(), JsValue> {
+        let len = self.playlist_len();
+        if len == 0 {
+            return Err(JsValue::from_str("No playlist loaded"));
+        }
+        if self.playlist_index + 1 >= len {
+            return Err(JsValue::from_str("Already at last track"));
+        }
+        self.playlist_index += 1;
+        self.reset_for_track();
+        self.load_current_track().await
+    }
+
+    /// Go back to the previous track in the playlist.
+    pub async fn previous_track(&mut self) -> Result<(), JsValue> {
+        if self.playlist.is_none() {
+            return Err(JsValue::from_str("No playlist loaded"));
+        }
+        if self.playlist_index == 0 {
+            return Err(JsValue::from_str("Already at first track"));
+        }
+        self.playlist_index -= 1;
+        self.reset_for_track();
+        self.load_current_track().await
+    }
+
+    /// Jump to a specific track by index.
+    pub async fn play_track(&mut self, index: usize) -> Result<(), JsValue> {
+        let len = self.playlist_len();
+        if index >= len {
+            return Err(JsValue::from_str("Track index out of bounds"));
+        }
+        self.playlist_index = index;
+        self.reset_for_track();
+        self.load_current_track().await
+    }
+
     /// Destroy the player and release all resources.
     pub fn destroy(&mut self) {
         self.video_decoder.close();
@@ -210,6 +294,8 @@ impl Player {
         self.data_buffer = None;
         self.event_callback = None;
         self.state = PlayerState::default();
+        self.playlist = None;
+        self.playlist_index = 0;
     }
 }
 
@@ -253,6 +339,45 @@ impl Player {
         }
 
         Ok(())
+    }
+
+    /// Get playlist length (0 if no playlist).
+    fn playlist_len(&self) -> usize {
+        self.playlist.as_ref().map(|p| p.entries.len()).unwrap_or(0)
+    }
+
+    /// Reset decoder/audio state before loading a new track.
+    fn reset_for_track(&mut self) {
+        self.video_decoder.close();
+        self.audio_pipeline.close();
+        self.renderer.clear();
+        self.data_buffer = None;
+        self.demuxer_format = None;
+        self.state.current_time_ms = 0;
+        self.state.has_video = false;
+        self.state.has_audio = false;
+        self.state.media_info = None;
+        self.state.duration_ms = None;
+        self.video_decoder = VideoDecoderWrapper::new();
+        self.audio_pipeline = AudioPipeline::new();
+        self.av_sync = AVSync::new();
+    }
+
+    /// Load the track at the current playlist_index.
+    async fn load_current_track(&mut self) -> Result<(), JsValue> {
+        let url = {
+            let playlist = self.playlist.as_ref()
+                .ok_or_else(|| JsValue::from_str("No playlist loaded"))?;
+            let entry = playlist.entries.get(self.playlist_index)
+                .ok_or_else(|| JsValue::from_str("Track index out of bounds"))?;
+            entry.url.clone()
+        };
+
+        self.emit_event(&PlayerEvent::PlaylistTrackChanged {
+            index: self.playlist_index,
+        });
+
+        self.load(url).await
     }
 
     /// Feed chunks from a demuxer to the decoders.

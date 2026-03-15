@@ -141,13 +141,57 @@ function handlePlayerEvent(event) {
             showError(`${event.recoverable ? '⚠' : '✖'} ${event.message}`);
             break;
 
-        case 'PlaybackEnded':
+        case 'PlaylistTrackChanged':
+            updatePlaylistUI(event.index);
+            break;
+
+        case 'Ended':
             setStatus('Ended');
             setControlsEnabled(true, false, false, false);
             break;
 
         default:
             console.log('Player event:', event);
+    }
+}
+
+// --- Playlist UI ---
+function isM3uUrl(url) {
+    const lower = url.toLowerCase();
+    return lower.endsWith('.m3u') || lower.endsWith('.m3u8') || lower.includes('m3u');
+}
+
+function displayPlaylist(playlist) {
+    if (!playlist || !playlist.entries || playlist.entries.length === 0) {
+        playlistPanel.classList.add('hidden');
+        return;
+    }
+    playlistList.innerHTML = '';
+    playlist.entries.forEach((entry, i) => {
+        const li = document.createElement('li');
+        const label = entry.title || entry.url.split('/').pop() || `Track ${i + 1}`;
+        const dur = entry.duration_secs ? ` (${formatTime(entry.duration_secs * 1000)})` : '';
+        li.textContent = `${i + 1}. ${label}${dur}`;
+        li.dataset.index = i;
+        li.addEventListener('click', () => playTrack(i));
+        playlistList.appendChild(li);
+    });
+    playlistPanel.classList.remove('hidden');
+}
+
+function updatePlaylistUI(activeIndex) {
+    const items = playlistList.querySelectorAll('li');
+    items.forEach((li, i) => {
+        li.classList.toggle('active', i === activeIndex);
+    });
+}
+
+async function playTrack(index) {
+    if (!player) return;
+    try {
+        await player.play_track(index);
+    } catch (e) {
+        showError(`Track load failed: ${e}`);
     }
 }
 
@@ -168,7 +212,16 @@ async function loadMedia() {
         player.on_event(handlePlayerEvent);
         setStatus('Loading...');
         showOverlay('Loading...');
-        await player.load(url);
+
+        if (isM3uUrl(url)) {
+            await player.load_playlist(url);
+            // Show playlist panel
+            const playlist = player.get_playlist();
+            displayPlaylist(playlist);
+        } else {
+            playlistPanel.classList.add('hidden');
+            await player.load(url);
+        }
     } catch (e) {
         showError(`Load failed: ${e}`);
         setStatus('Error');
