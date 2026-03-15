@@ -132,8 +132,24 @@ function handlePlayerEvent(event) {
             }
             break;
 
+        case 'DownloadProgress': {
+            const received = event.received_bytes;
+            const total = event.total_bytes;
+            if (total > 0) {
+                const pct = Math.round((received / total) * 100);
+                const mb = (received / 1048576).toFixed(1);
+                const totalMb = (total / 1048576).toFixed(1);
+                showOverlay(`Downloading... ${pct}% (${mb} / ${totalMb} MB)`);
+                setStatus(`Downloading: ${pct}%`);
+            } else {
+                const mb = (received / 1048576).toFixed(1);
+                showOverlay(`Downloading... ${mb} MB`);
+                setStatus(`Downloading: ${mb} MB`);
+            }
+            break;
+        }
+
         case 'VideoResized':
-            // Canvas auto-resizes via CSS, but log it
             console.log(`Video resized: ${event.width}×${event.height}`);
             break;
 

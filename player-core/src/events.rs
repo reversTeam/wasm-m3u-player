@@ -25,6 +25,10 @@ pub enum PlayerEvent {
     BufferUpdate {
         buffered_ms: u64,
     },
+    DownloadProgress {
+        received_bytes: u64,
+        total_bytes: u64,
+    },
     Error {
         message: String,
         recoverable: bool,

@@ -7,7 +7,7 @@ use player_core::{MediaInfo, PlaybackStatus, PlayerEvent, PlayerState};
 
 use crate::audio::AudioPipeline;
 use crate::decoder::VideoDecoderWrapper;
-use crate::fetch::fetch_bytes;
+use crate::fetch::fetch_bytes_with_progress;
 use crate::renderer::CanvasRenderer;
 use crate::sync::AVSync;
 
@@ -73,8 +73,20 @@ impl Player {
             status: PlaybackStatus::Loading,
         });
 
-        // Fetch the entire file (MVP — progressive streaming later)
-        let data = fetch_bytes(&url).await?;
+        // Fetch with streaming progress reporting
+        let event_cb = self.event_callback.clone();
+        let progress_cb = Box::new(move |received: u64, total: u64| {
+            if let Some(ref cb) = event_cb {
+                let event = PlayerEvent::DownloadProgress {
+                    received_bytes: received,
+                    total_bytes: total,
+                };
+                if let Ok(js_event) = serde_wasm_bindgen::to_value(&event) {
+                    let _ = cb.call1(&JsValue::NULL, &js_event);
+                }
+            }
+        });
+        let data = fetch_bytes_with_progress(&url, Some(progress_cb)).await?;
 
         // Detect format
         let format = detect_format(&data);
@@ -215,8 +227,8 @@ impl Player {
             status: PlaybackStatus::Loading,
         });
 
-        // Fetch playlist text
-        let data = fetch_bytes(&url).await?;
+        // Fetch playlist text (small file, no progress needed)
+        let data = fetch_bytes_with_progress(&url, None).await?;
         let text = String::from_utf8(data)
             .map_err(|_| JsValue::from_str("Playlist is not valid UTF-8"))?;
 
