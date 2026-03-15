@@ -1,4 +1,4 @@
-import init, { Player } from './pkg/player_wasm.js';
+import init, { Player } from './pkg/player.js';
 
 // --- DOM Elements ---
 const urlInput = document.getElementById('url-input');
@@ -157,8 +157,9 @@ function handlePlayerEvent(event) {
 
 // --- Playlist UI ---
 function isM3uUrl(url) {
-    const lower = url.toLowerCase();
-    return lower.endsWith('.m3u') || lower.endsWith('.m3u8') || lower.includes('m3u');
+    // Strip query string / fragment before checking extension
+    const path = url.toLowerCase().split('?')[0].split('#')[0];
+    return path.endsWith('.m3u') || path.endsWith('.m3u8');
 }
 
 function displayPlaylist(playlist) {

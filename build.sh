@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ensure rustup toolchain takes priority over Homebrew
+export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:$PATH"
+
 # Check for wasm-pack
 if ! command -v wasm-pack &> /dev/null; then
     echo "wasm-pack not found. Installing..."
