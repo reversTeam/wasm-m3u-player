@@ -8,6 +8,7 @@ pub enum PlaybackStatus {
     Ready,
     Playing,
     Paused,
+    Buffering,
     Stopped,
     Seeking,
     Error,

@@ -1,5 +1,6 @@
 use wasm_bindgen::prelude::*;
 
+pub mod buffer;
 pub mod decoder;
 pub mod renderer;
 pub mod fetch;

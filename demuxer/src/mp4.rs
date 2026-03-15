@@ -108,6 +108,16 @@ impl Mp4Demuxer {
         }
         Vec::new()
     }
+
+    /// Get current sample cursor positions for resume after re-creation.
+    pub fn sample_positions(&self) -> Vec<(u32, u32)> {
+        self.sample_cursors.clone()
+    }
+
+    /// Set sample cursor positions to resume demuxing from a known point.
+    pub fn set_sample_positions(&mut self, cursors: Vec<(u32, u32)>) {
+        self.sample_cursors = cursors;
+    }
 }
 
 impl Demuxer for Mp4Demuxer {

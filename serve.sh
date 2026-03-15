@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT="${1:-8080}"
+PORT="${1:-9091}"
 
 echo "Serving www/ on http://localhost:${PORT}"
 echo "Headers: COOP=same-origin, COEP=require-corp"

@@ -56,4 +56,6 @@ features = [
     "AudioBuffer",
     "AudioBufferSourceNode",
     "AudioDestinationNode",
+    # Timing
+    "Performance",
 ]

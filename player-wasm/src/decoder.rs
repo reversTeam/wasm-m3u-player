@@ -123,6 +123,14 @@ impl VideoDecoderWrapper {
         self.frame_queue.borrow_mut().pop_front()
     }
 
+    /// Peek at the timestamp (in microseconds) of the next frame without removing it.
+    pub fn peek_timestamp_us(&self) -> Option<f64> {
+        self.frame_queue
+            .borrow()
+            .front()
+            .map(|f| f.timestamp().unwrap_or(0.0))
+    }
+
     /// Get the number of frames waiting in the queue.
     pub fn queue_len(&self) -> usize {
         self.frame_queue.borrow().len()

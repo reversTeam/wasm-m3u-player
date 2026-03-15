@@ -10,6 +10,8 @@ pub struct MkvDemuxer {
     media_info: Option<MediaInfo>,
     video_track_ids: Vec<u64>,
     audio_track_ids: Vec<u64>,
+    /// Number of frames read so far (for resume after re-creation).
+    frames_read: usize,
 }
 
 impl MkvDemuxer {
@@ -19,6 +21,7 @@ impl MkvDemuxer {
             media_info: None,
             video_track_ids: Vec::new(),
             audio_track_ids: Vec::new(),
+            frames_read: 0,
         }
     }
 
@@ -43,6 +46,28 @@ impl MkvDemuxer {
             "V_AV1" => "av01.0.01M.08".to_string(),
             _ => format!("unknown:{}", codec_id),
         }
+    }
+
+    /// Get the number of frames read so far (for resume tracking).
+    pub fn frames_read(&self) -> usize {
+        self.frames_read
+    }
+
+    /// Skip N frames (used after re-creating demuxer to resume position).
+    pub fn skip_frames(&mut self, count: usize) -> Result<(), DemuxError> {
+        let mkv = self
+            .mkv
+            .as_mut()
+            .ok_or_else(|| DemuxError::InvalidData("No header parsed yet".into()))?;
+        let mut frame = Frame::default();
+        for _ in 0..count {
+            match mkv.next_frame(&mut frame) {
+                Ok(true) => self.frames_read += 1,
+                Ok(false) => break,
+                Err(e) => return Err(DemuxError::InvalidData(format!("Skip error: {}", e))),
+            }
+        }
+        Ok(())
     }
 
     fn map_audio_codec(codec_id: &str) -> String {
@@ -152,6 +177,7 @@ impl Demuxer for MkvDemuxer {
         let mut frame = Frame::default();
         match mkv.next_frame(&mut frame) {
             Ok(true) => {
+                self.frames_read += 1;
                 let track_number = frame.track;
                 let is_video = self.video_track_ids.contains(&track_number);
 

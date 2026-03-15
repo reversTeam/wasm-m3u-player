@@ -20,6 +20,7 @@ const playlistPanel = document.getElementById('playlist-panel');
 const playlistList = document.getElementById('playlist-list');
 
 let player = null;
+let rafId = null; // requestAnimationFrame handle
 
 // --- Helpers ---
 function formatTime(ms) {
@@ -63,7 +64,7 @@ function displayMediaInfo(info) {
     mediaInfoList.innerHTML = '';
     const items = [];
     if (info.video_codec) items.push(`Video: ${info.video_codec}`);
-    if (info.width && info.height) items.push(`Resolution: ${info.width}×${info.height}`);
+    if (info.width && info.height) items.push(`Resolution: ${info.width}\u00d7${info.height}`);
     if (info.fps) items.push(`FPS: ${info.fps.toFixed(1)}`);
     if (info.audio_codec) items.push(`Audio: ${info.audio_codec}`);
     if (info.sample_rate) items.push(`Sample rate: ${info.sample_rate} Hz`);
@@ -76,6 +77,28 @@ function displayMediaInfo(info) {
         mediaInfoList.appendChild(li);
     }
     mediaInfoPanel.classList.remove('hidden');
+}
+
+// --- Render Loop ---
+function startRenderLoop() {
+    stopRenderLoop();
+    function tick() {
+        if (!player) return;
+        const shouldContinue = player.render_tick();
+        if (shouldContinue) {
+            rafId = requestAnimationFrame(tick);
+        } else {
+            rafId = null;
+        }
+    }
+    rafId = requestAnimationFrame(tick);
+}
+
+function stopRenderLoop() {
+    if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+    }
 }
 
 // --- Event Handler ---
@@ -99,14 +122,21 @@ function handlePlayerEvent(event) {
                     setControlsEnabled(false, true, true, false);
                     break;
                 case 'Paused':
+                    stopRenderLoop();
                     setControlsEnabled(true, false, true, false);
                     break;
+                case 'Buffering':
+                    showOverlay('Buffering...');
+                    setControlsEnabled(false, true, true, false);
+                    break;
                 case 'Stopped':
+                    stopRenderLoop();
                     setControlsEnabled(true, false, false, false);
                     timeCurrent.textContent = '0:00';
                     seekBar.value = 0;
                     break;
                 case 'Error':
+                    stopRenderLoop();
                     hideOverlay();
                     setControlsEnabled(false, false, true, false);
                     break;
@@ -150,18 +180,23 @@ function handlePlayerEvent(event) {
         }
 
         case 'VideoResized':
-            console.log(`Video resized: ${event.width}×${event.height}`);
+            console.log(`Video resized: ${event.width}\u00d7${event.height}`);
             break;
 
         case 'Error':
-            showError(`${event.recoverable ? '⚠' : '✖'} ${event.message}`);
+            showError(`${event.recoverable ? '\u26a0' : '\u2716'} ${event.message}`);
             break;
 
         case 'PlaylistTrackChanged':
             updatePlaylistUI(event.index);
             break;
 
+        case 'BufferUpdate':
+            // Could display buffer level in UI
+            break;
+
         case 'Ended':
+            stopRenderLoop();
             setStatus('Ended');
             setControlsEnabled(true, false, false, false);
             break;
@@ -173,7 +208,6 @@ function handlePlayerEvent(event) {
 
 // --- Playlist UI ---
 function isM3uUrl(url) {
-    // Strip query string / fragment before checking extension
     const path = url.toLowerCase().split('?')[0].split('#')[0];
     return path.endsWith('.m3u') || path.endsWith('.m3u8');
 }
@@ -206,6 +240,7 @@ function updatePlaylistUI(activeIndex) {
 async function playTrack(index) {
     if (!player) return;
     try {
+        stopRenderLoop();
         await player.play_track(index);
     } catch (e) {
         showError(`Track load failed: ${e}`);
@@ -218,6 +253,7 @@ async function loadMedia() {
     if (!url) return;
 
     hideError();
+    stopRenderLoop();
 
     // Destroy previous player if any
     if (player) {
@@ -232,7 +268,6 @@ async function loadMedia() {
 
         if (isM3uUrl(url)) {
             await player.load_playlist(url);
-            // Show playlist panel
             const playlist = player.get_playlist();
             displayPlaylist(playlist);
         } else {
@@ -250,6 +285,7 @@ async function play() {
     if (!player) return;
     try {
         await player.play();
+        startRenderLoop();
     } catch (e) {
         showError(`Play failed: ${e}`);
     }
@@ -258,10 +294,12 @@ async function play() {
 function pause() {
     if (!player) return;
     player.pause();
+    // render loop is stopped in the event handler
 }
 
 function stop() {
     if (!player) return;
+    stopRenderLoop();
     player.stop();
 }
 
@@ -279,7 +317,7 @@ async function main() {
     try {
         setStatus('Initializing WASM...');
         await init();
-        setStatus('Ready — enter a video URL');
+        setStatus('Ready \u2014 enter a video URL');
         loadBtn.disabled = false;
     } catch (e) {
         showError(`WASM init failed: ${e}`);
