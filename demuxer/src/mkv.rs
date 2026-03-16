@@ -116,6 +116,10 @@ pub struct MkvDemuxer {
     /// TimestampScale in nanoseconds (default 1_000_000 = 1ms per tick).
     /// Used to convert frame.timestamp (ticks) to microseconds.
     timestamp_scale_ns: u64,
+    /// Raw buffer used during parse_header, kept for seek rewind.
+    /// MatroskaFile has no rewind/into_inner, so we store the data
+    /// to re-create the MatroskaFile when seeking.
+    raw_data: Option<Vec<u8>>,
 }
 
 impl MkvDemuxer {
@@ -128,6 +132,7 @@ impl MkvDemuxer {
             frames_read: 0,
             seek_index: SeekIndex::new(),
             timestamp_scale_ns: 1_000_000, // default: 1ms per tick
+            raw_data: None,
         }
     }
 
@@ -357,7 +362,9 @@ impl Demuxer for MkvDemuxer {
     }
 
     fn parse_header(&mut self, data: &[u8]) -> Result<MediaInfo, DemuxError> {
-        let cursor = Cursor::new(data.to_vec());
+        let owned = data.to_vec();
+        let cursor = Cursor::new(owned.clone());
+        self.raw_data = Some(owned);
 
         let mkv = MatroskaFile::open(cursor)
             .map_err(|e| DemuxError::InvalidData(format!("MKV parse error: {}", e)))?;
@@ -492,17 +499,19 @@ impl Demuxer for MkvDemuxer {
 
     fn seek_to_keyframe(&mut self, timestamp_us: i64) -> Result<(), DemuxError> {
         // matroska-demuxer doesn't support native seeking.
-        // Strategy: re-parse from beginning and scan frames until we find the last
-        // keyframe whose timestamp <= target. Then set frames_read so that
-        // try_demux_more can resume from that position.
+        // Strategy:
+        // 1. Scan frames to find the last video keyframe before target (skip_count)
+        // 2. Re-create the MatroskaFile from the same buffer (rewind)
+        // 3. Skip exactly skip_count frames so next_chunk() returns the keyframe
+        //
+        // We MUST re-create because MatroskaFile has no rewind — scanning consumes
+        // the internal cursor irreversibly.
         let mkv = self
             .mkv
             .as_mut()
             .ok_or_else(|| DemuxError::InvalidData("No header parsed yet".into()))?;
 
-        // Scan all frames to find the last video keyframe before target.
-        // We track `skip_count`: the number of frames to skip so that the NEXT
-        // frame returned by `next_chunk()` is the keyframe itself.
+        // Phase 1: Scan all frames to find skip_count
         let mut frame = Frame::default();
         let mut skip_count: usize = 0;
         let mut count: usize = 0;
@@ -517,7 +526,6 @@ impl Demuxer for MkvDemuxer {
                     // Track last video keyframe before target
                     let is_video = self.video_track_ids.contains(&frame.track);
                     if is_video && frame.is_keyframe.unwrap_or(false) && frame_ts_us <= timestamp_us {
-                        // skip everything BEFORE this keyframe (count-1 frames)
                         skip_count = count - 1;
                     }
 
@@ -531,9 +539,22 @@ impl Demuxer for MkvDemuxer {
             }
         }
 
-        // Set frames_read so try_demux_more skips to just BEFORE the keyframe,
-        // and the keyframe is the first frame returned by next_chunk().
-        self.frames_read = skip_count;
+        // Phase 2: Re-create MatroskaFile from stored raw data
+        // MatroskaFile has no rewind/into_inner, so we use the copy saved during parse_header.
+        let data = self.raw_data.as_ref()
+            .ok_or_else(|| DemuxError::InvalidData("No raw data stored for seek rewind".into()))?
+            .clone();
+        self.mkv.take(); // drop the consumed demuxer
+
+        // Re-create MatroskaFile from the same data
+        let fresh_cursor = Cursor::new(data);
+        let fresh_mkv = MatroskaFile::open(fresh_cursor)
+            .map_err(|e| DemuxError::InvalidData(format!("MKV seek rewind error: {}", e)))?;
+        self.mkv = Some(fresh_mkv);
+
+        // Phase 3: Skip to the keyframe position
+        self.frames_read = 0;
+        self.skip_frames(skip_count)?;
 
         Ok(())
     }
