@@ -23,6 +23,7 @@ const downloadBar = document.getElementById('download-bar');
 let player = null;
 let rafId = null; // requestAnimationFrame handle
 let currentStatus = 'Idle'; // Track player status to avoid overlay conflicts
+let mediaDurationMs = 0; // Cached duration — avoids calling get_state() inside render_tick callbacks
 
 // --- Helpers ---
 function formatTime(ms) {
@@ -86,11 +87,17 @@ function startRenderLoop() {
     stopRenderLoop();
     function tick() {
         if (!player) return;
-        const shouldContinue = player.render_tick();
-        if (shouldContinue) {
+        try {
+            const shouldContinue = player.render_tick();
+            if (shouldContinue) {
+                rafId = requestAnimationFrame(tick);
+            } else {
+                rafId = null;
+            }
+        } catch (e) {
+            console.error('[render_tick] Exception caught — restarting loop:', e);
+            // Don't let the render loop die on transient errors
             rafId = requestAnimationFrame(tick);
-        } else {
-            rafId = null;
         }
     }
     rafId = requestAnimationFrame(tick);
@@ -153,7 +160,8 @@ function handlePlayerEvent(event) {
             if (event.info) {
                 displayMediaInfo(event.info);
                 if (event.info.duration_ms) {
-                    timeDuration.textContent = formatTime(event.info.duration_ms);
+                    mediaDurationMs = event.info.duration_ms;
+                    timeDuration.textContent = formatTime(mediaDurationMs);
                 }
             }
             break;
@@ -161,9 +169,10 @@ function handlePlayerEvent(event) {
         case 'TimeUpdate':
             if (event.current_ms != null) {
                 timeCurrent.textContent = formatTime(event.current_ms);
-                const state = player?.get_state();
-                if (state?.duration_ms) {
-                    seekBar.value = Math.round((event.current_ms / state.duration_ms) * 1000);
+                // Use cached duration — calling get_state() here would cause a
+                // RefCell double-borrow panic because we're inside render_tick's &mut self.
+                if (mediaDurationMs > 0) {
+                    seekBar.value = Math.round((event.current_ms / mediaDurationMs) * 1000);
                 }
             }
             break;
@@ -321,9 +330,9 @@ async function play() {
     }
 }
 
-function pause() {
+async function pause() {
     if (!player) return;
-    player.pause();
+    await player.pause();
     // render loop is stopped in the event handler
 }
 
@@ -338,25 +347,21 @@ let isSeeking = false;
 
 seekBar.addEventListener('input', () => {
     // While dragging, update the time display but don't seek yet
-    if (!player) return;
-    const state = player.get_state();
-    if (state?.duration_ms) {
-        const targetMs = Math.round((seekBar.value / 1000) * state.duration_ms);
-        timeCurrent.textContent = formatTime(targetMs);
-    }
+    if (!player || mediaDurationMs <= 0) return;
+    const targetMs = Math.round((seekBar.value / 1000) * mediaDurationMs);
+    timeCurrent.textContent = formatTime(targetMs);
 });
 
 seekBar.addEventListener('change', async () => {
-    if (!player || isSeeking) return;
-    const state = player.get_state();
-    if (!state?.duration_ms) return;
+    if (!player || isSeeking || mediaDurationMs <= 0) return;
 
-    const targetMs = Math.round((seekBar.value / 1000) * state.duration_ms);
+    const targetMs = Math.round((seekBar.value / 1000) * mediaDurationMs);
+    const wasPlaying = currentStatus === 'Playing' || currentStatus === 'Buffering';
     isSeeking = true;
     try {
-        await player.seek(targetMs);
+        await player.seek(BigInt(targetMs));
         // Restart render loop if we were playing
-        if (state.status === 'Playing' || state.status === 'Buffering') {
+        if (wasPlaying) {
             startRenderLoop();
         }
     } catch (e) {

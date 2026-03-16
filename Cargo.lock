@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "ac3-decode"
+version = "0.1.0"
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -183,6 +187,7 @@ name = "player-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -190,6 +195,7 @@ dependencies = [
 name = "player-wasm"
 version = "0.1.0"
 dependencies = [
+ "ac3-decode",
  "console_error_panic_hook",
  "demuxer",
  "js-sys",

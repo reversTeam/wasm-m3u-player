@@ -11,34 +11,54 @@ use web_sys::{
 
 use demuxer::EncodedChunk;
 
+/// PCM buffer produced by the software decoder (deinterleaved f32).
+struct PcmBuffer {
+    channels: Vec<Vec<f32>>,
+    sample_rate: f32,
+}
+
+/// Which backend is active for audio decoding.
+enum AudioBackend {
+    /// WebCodecs AudioDecoder (hardware-accelerated).
+    WebCodecs {
+        decoder: AudioDecoder,
+        data_queue: Rc<RefCell<VecDeque<AudioData>>>,
+        error: Rc<RefCell<Option<String>>>,
+        _output_closure: Closure<dyn FnMut(AudioData)>,
+        _error_closure: Closure<dyn FnMut(JsValue)>,
+    },
+    /// Software AC-3/E-AC-3 decoder (pure Rust).
+    Software {
+        decoder: ac3_decode::Ac3Decoder,
+        sample_rate: u32,
+        channels: u32,
+        pcm_queue: VecDeque<PcmBuffer>,
+        /// Suppress repeated error logging (e.g., E-AC-3 unsupported on every frame).
+        error_count: u32,
+    },
+}
+
 /// Wrapper around WebCodecs AudioDecoder + Web Audio API playback.
+/// Falls back to a pure-Rust software decoder for codecs not supported
+/// by WebCodecs (AC-3, E-AC-3).
 pub struct AudioPipeline {
-    decoder: Option<AudioDecoder>,
+    backend: Option<AudioBackend>,
     audio_ctx: Option<AudioContext>,
-    /// Queue of decoded AudioData waiting to be played.
-    data_queue: Rc<RefCell<VecDeque<AudioData>>>,
-    error: Rc<RefCell<Option<String>>>,
     /// Next scheduled playback time in AudioContext seconds.
     next_play_time: f64,
-    /// Keep closures alive.
-    _output_closure: Option<Closure<dyn FnMut(AudioData)>>,
-    _error_closure: Option<Closure<dyn FnMut(JsValue)>>,
 }
 
 impl AudioPipeline {
     pub fn new() -> Self {
         Self {
-            decoder: None,
+            backend: None,
             audio_ctx: None,
-            data_queue: Rc::new(RefCell::new(VecDeque::new())),
-            error: Rc::new(RefCell::new(None)),
             next_play_time: 0.0,
-            _output_closure: None,
-            _error_closure: None,
         }
     }
 
     /// Configure the audio decoder and create AudioContext.
+    /// Tries WebCodecs first; falls back to software decoder for AC-3/E-AC-3.
     pub fn configure(
         &mut self,
         codec: &str,
@@ -49,17 +69,41 @@ impl AudioPipeline {
         // Create AudioContext (must be resumed after user interaction)
         let audio_ctx = AudioContext::new()?;
         self.next_play_time = audio_ctx.current_time();
+        self.audio_ctx = Some(audio_ctx);
 
-        let data_queue = self.data_queue.clone();
-        let error_state = self.error.clone();
+        // Check if this is an AC-3/E-AC-3 codec — use software decoder directly
+        // (WebCodecs rejects these asynchronously, which causes silent failures)
+        if codec == "ac-3" || codec == "ec-3" {
+            web_sys::console::log_1(
+                &format!(
+                    "[audio] Using software AC-3/E-AC-3 decoder for codec '{}'",
+                    codec
+                )
+                .into(),
+            );
+            self.backend = Some(AudioBackend::Software {
+                decoder: ac3_decode::Ac3Decoder::new(),
+                sample_rate,
+                channels,
+                pcm_queue: VecDeque::new(),
+                error_count: 0,
+            });
+            return Ok(());
+        }
 
+        // Try WebCodecs
+        let data_queue = Rc::new(RefCell::new(VecDeque::new()));
+        let error = Rc::new(RefCell::new(None));
+
+        let dq = data_queue.clone();
         let output_closure = Closure::wrap(Box::new(move |data: AudioData| {
-            data_queue.borrow_mut().push_back(data);
+            dq.borrow_mut().push_back(data);
         }) as Box<dyn FnMut(AudioData)>);
 
+        let es = error.clone();
         let error_closure = Closure::wrap(Box::new(move |e: JsValue| {
             let msg = e.as_string().unwrap_or_else(|| format!("{:?}", e));
-            *error_state.borrow_mut() = Some(msg);
+            *es.borrow_mut() = Some(msg);
         }) as Box<dyn FnMut(JsValue)>);
 
         let init = AudioDecoderInit::new(
@@ -70,7 +114,6 @@ impl AudioPipeline {
         let decoder = AudioDecoder::new(&init)?;
 
         let config = AudioDecoderConfig::new(codec, channels, sample_rate);
-
         if let Some(config_data) = codec_config {
             if !config_data.is_empty() {
                 let buffer = js_sys::Uint8Array::from(config_data);
@@ -80,51 +123,125 @@ impl AudioPipeline {
 
         decoder.configure(&config)?;
 
-        self.decoder = Some(decoder);
-        self.audio_ctx = Some(audio_ctx);
-        self._output_closure = Some(output_closure);
-        self._error_closure = Some(error_closure);
+        self.backend = Some(AudioBackend::WebCodecs {
+            decoder,
+            data_queue,
+            error,
+            _output_closure: output_closure,
+            _error_closure: error_closure,
+        });
 
         Ok(())
     }
 
     /// Decode an encoded audio chunk from the demuxer.
-    pub fn decode(&self, chunk: &EncodedChunk) -> Result<(), JsValue> {
-        let decoder = self
-            .decoder
-            .as_ref()
-            .ok_or_else(|| JsValue::from_str("Audio decoder not configured"))?;
+    pub fn decode(&mut self, chunk: &EncodedChunk) -> Result<(), JsValue> {
+        match &mut self.backend {
+            Some(AudioBackend::WebCodecs {
+                decoder,
+                error,
+                ..
+            }) => {
+                if let Some(err) = error.borrow().as_ref() {
+                    return Err(JsValue::from_str(&format!("Audio decoder error: {}", err)));
+                }
 
-        if let Some(err) = self.error.borrow().as_ref() {
-            return Err(JsValue::from_str(&format!("Audio decoder error: {}", err)));
+                let chunk_type = if chunk.is_keyframe {
+                    EncodedAudioChunkType::Key
+                } else {
+                    EncodedAudioChunkType::Delta
+                };
+
+                let data = js_sys::Uint8Array::from(chunk.data.as_slice());
+                let init = EncodedAudioChunkInit::new(&data.buffer(), 0_i32, chunk_type);
+                js_sys::Reflect::set(
+                    init.as_ref(),
+                    &"timestamp".into(),
+                    &JsValue::from_f64(chunk.timestamp_us as f64),
+                )?;
+
+                let encoded_chunk = EncodedAudioChunk::new(&init)?;
+                decoder.decode(&encoded_chunk)?;
+                Ok(())
+            }
+            Some(AudioBackend::Software {
+                decoder,
+                sample_rate: _,
+                channels: _,
+                pcm_queue,
+                error_count,
+            }) => {
+                // Software AC-3/E-AC-3 decode
+                match decoder.decode_frame(&chunk.data) {
+                    Ok(decoded) => {
+                        // Convert interleaved to deinterleaved
+                        let nch = decoded.channels as usize;
+                        let samples_per_ch = decoded.samples_per_channel;
+                        let mut channels_data = vec![vec![0.0f32; samples_per_ch]; nch];
+
+                        for s in 0..samples_per_ch {
+                            for ch in 0..nch {
+                                channels_data[ch][s] = decoded.samples[s * nch + ch];
+                            }
+                        }
+
+                        // Downmix to stereo if needed (most Web Audio contexts are stereo)
+                        let final_channels = if nch > 2 {
+                            downmix_to_stereo(&channels_data, nch)
+                        } else {
+                            channels_data
+                        };
+
+                        pcm_queue.push_back(PcmBuffer {
+                            channels: final_channels,
+                            sample_rate: decoded.sample_rate as f32,
+                        });
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Log first few errors, then suppress to avoid flooding console
+                        *error_count += 1;
+                        if *error_count <= 3 {
+                            let hex: String = chunk.data.iter().take(12)
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            web_sys::console::log_1(
+                                &format!(
+                                    "[audio-sw] decode error: {} (len={}, head={})",
+                                    e, chunk.data.len(), hex
+                                ).into(),
+                            );
+                            if *error_count == 3 {
+                                web_sys::console::log_1(
+                                    &"[audio-sw] suppressing further decode errors".into(),
+                                );
+                            }
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            None => Err(JsValue::from_str("Audio decoder not configured")),
         }
-
-        let chunk_type = if chunk.is_keyframe {
-            EncodedAudioChunkType::Key
-        } else {
-            EncodedAudioChunkType::Delta
-        };
-
-        let data = js_sys::Uint8Array::from(chunk.data.as_slice());
-        let init =
-            EncodedAudioChunkInit::new(&data.buffer(), chunk.timestamp_us as i32, chunk_type);
-
-        let encoded_chunk = EncodedAudioChunk::new(&init)?;
-        decoder.decode(&encoded_chunk)?;
-
-        Ok(())
     }
 
     /// Drain all decoded audio data from the queue without closing the decoder.
-    /// Used during seek to clear stale audio.
-    pub fn flush_queue(&self) {
-        for data in self.data_queue.borrow_mut().drain(..) {
-            data.close();
+    pub fn flush_queue(&mut self) {
+        match &mut self.backend {
+            Some(AudioBackend::WebCodecs { data_queue, .. }) => {
+                for data in data_queue.borrow_mut().drain(..) {
+                    data.close();
+                }
+            }
+            Some(AudioBackend::Software { pcm_queue, .. }) => {
+                pcm_queue.clear();
+            }
+            None => {}
         }
     }
 
     /// Reset the audio scheduling time to the current AudioContext time.
-    /// Called after seek to avoid scheduling audio in the past.
     pub fn reset_schedule(&mut self) {
         if let Some(ctx) = &self.audio_ctx {
             self.next_play_time = ctx.current_time();
@@ -132,55 +249,109 @@ impl AudioPipeline {
     }
 
     /// Schedule decoded audio data for playback via AudioBufferSourceNode.
-    /// Should be called regularly (e.g. each rAF) to drain the queue.
     pub fn pump_audio(&mut self) -> Result<(), JsValue> {
         let ctx = match &self.audio_ctx {
-            Some(ctx) => ctx,
+            Some(ctx) => ctx.clone(),
             None => return Ok(()),
         };
 
-        let mut queue = self.data_queue.borrow_mut();
-        while let Some(audio_data) = queue.pop_front() {
-            let sample_rate = audio_data.sample_rate() as f32;
-            let num_channels = audio_data.number_of_channels();
-            let num_frames = audio_data.number_of_frames();
-
-            // Create AudioBuffer and copy each channel from AudioData
-            let audio_buffer =
-                ctx.create_buffer(num_channels, num_frames, sample_rate)?;
-
-            // Copy each plane (channel) separately using f32-planar format
-            for ch in 0..num_channels {
-                let js_buffer = js_sys::ArrayBuffer::new(num_frames * 4); // f32 = 4 bytes
-
-                let opts = AudioDataCopyToOptions::new(ch);
-                opts.set_format(AudioSampleFormat::F32Planar);
-
-                audio_data.copy_to_with_buffer_source(&js_buffer, &opts)?;
-
-                let float_array = js_sys::Float32Array::new(&js_buffer);
-                let mut channel_data = vec![0f32; num_frames as usize];
-                float_array.copy_to(&mut channel_data);
-
-                audio_buffer.copy_to_channel(&mut channel_data, ch as i32)?;
-            }
-
-            audio_data.close();
-
-            // Schedule playback
-            let source: AudioBufferSourceNode = ctx.create_buffer_source()?;
-            source.set_buffer(Some(&audio_buffer));
-            source.connect_with_audio_node(&ctx.destination())?;
-
-            // Don't schedule in the past
-            let current_time = ctx.current_time();
-            if self.next_play_time < current_time {
-                self.next_play_time = current_time;
-            }
-
-            source.start_with_when(self.next_play_time)?;
-            self.next_play_time += num_frames as f64 / sample_rate as f64;
+        // Drain queues into local vecs to avoid borrow conflicts with self
+        enum Pending {
+            WebCodecs(Vec<AudioData>),
+            Software(Vec<PcmBuffer>),
         }
+
+        let pending = match &mut self.backend {
+            Some(AudioBackend::WebCodecs { data_queue, .. }) => {
+                let items: Vec<_> = data_queue.borrow_mut().drain(..).collect();
+                if items.is_empty() { return Ok(()); }
+                Pending::WebCodecs(items)
+            }
+            Some(AudioBackend::Software { pcm_queue, .. }) => {
+                let items: Vec<_> = pcm_queue.drain(..).collect();
+                if items.is_empty() { return Ok(()); }
+                Pending::Software(items)
+            }
+            None => return Ok(()),
+        };
+
+        match pending {
+            Pending::WebCodecs(items) => {
+                for audio_data in items {
+                    self.schedule_audio_data(&ctx, &audio_data)?;
+                    audio_data.close();
+                }
+            }
+            Pending::Software(items) => {
+                for pcm in items {
+                    self.schedule_pcm(&ctx, &pcm)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Schedule WebCodecs AudioData for playback.
+    fn schedule_audio_data(&mut self, ctx: &AudioContext, audio_data: &AudioData) -> Result<(), JsValue> {
+        let sample_rate = audio_data.sample_rate() as f32;
+        let num_channels = audio_data.number_of_channels();
+        let num_frames = audio_data.number_of_frames();
+
+        let audio_buffer = ctx.create_buffer(num_channels, num_frames, sample_rate)?;
+
+        for ch in 0..num_channels {
+            let js_buffer = js_sys::ArrayBuffer::new(num_frames * 4);
+            let opts = AudioDataCopyToOptions::new(ch);
+            opts.set_format(AudioSampleFormat::F32Planar);
+            audio_data.copy_to_with_buffer_source(&js_buffer, &opts)?;
+            let float_array = js_sys::Float32Array::new(&js_buffer);
+            let mut channel_data = vec![0f32; num_frames as usize];
+            float_array.copy_to(&mut channel_data);
+            audio_buffer.copy_to_channel(&mut channel_data, ch as i32)?;
+        }
+
+        let source: AudioBufferSourceNode = ctx.create_buffer_source()?;
+        source.set_buffer(Some(&audio_buffer));
+        source.connect_with_audio_node(&ctx.destination())?;
+
+        let current_time = ctx.current_time();
+        if self.next_play_time < current_time {
+            self.next_play_time = current_time;
+        }
+
+        source.start_with_when(self.next_play_time)?;
+        self.next_play_time += num_frames as f64 / sample_rate as f64;
+
+        Ok(())
+    }
+
+    /// Schedule software-decoded PCM for playback.
+    fn schedule_pcm(&mut self, ctx: &AudioContext, pcm: &PcmBuffer) -> Result<(), JsValue> {
+        let nch = pcm.channels.len() as u32;
+        if nch == 0 || pcm.channels[0].is_empty() {
+            return Ok(());
+        }
+        let num_frames = pcm.channels[0].len() as u32;
+
+        let audio_buffer = ctx.create_buffer(nch, num_frames, pcm.sample_rate)?;
+
+        for ch in 0..nch as usize {
+            let mut data = pcm.channels[ch].clone();
+            audio_buffer.copy_to_channel(&mut data, ch as i32)?;
+        }
+
+        let source: AudioBufferSourceNode = ctx.create_buffer_source()?;
+        source.set_buffer(Some(&audio_buffer));
+        source.connect_with_audio_node(&ctx.destination())?;
+
+        let current_time = ctx.current_time();
+        if self.next_play_time < current_time {
+            self.next_play_time = current_time;
+        }
+
+        source.start_with_when(self.next_play_time)?;
+        self.next_play_time += num_frames as f64 / pcm.sample_rate as f64;
 
         Ok(())
     }
@@ -193,7 +364,16 @@ impl AudioPipeline {
             .unwrap_or(0.0)
     }
 
-    /// Resume AudioContext (must be called after user interaction).
+    /// Suspend AudioContext.
+    pub async fn suspend(&self) -> Result<(), JsValue> {
+        if let Some(ctx) = &self.audio_ctx {
+            let promise = ctx.suspend()?;
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(promise)).await?;
+        }
+        Ok(())
+    }
+
+    /// Resume AudioContext.
     pub async fn resume(&self) -> Result<(), JsValue> {
         if let Some(ctx) = &self.audio_ctx {
             let promise = ctx.resume()?;
@@ -204,24 +384,42 @@ impl AudioPipeline {
 
     /// Close the audio pipeline and release resources.
     pub fn close(&mut self) {
-        if let Some(decoder) = self.decoder.take() {
-            let _ = decoder.close();
+        match self.backend.take() {
+            Some(AudioBackend::WebCodecs { decoder, data_queue, .. }) => {
+                let _ = decoder.close();
+                for data in data_queue.borrow_mut().drain(..) {
+                    data.close();
+                }
+            }
+            Some(AudioBackend::Software { .. }) => {
+                // Nothing to close — pure Rust
+            }
+            None => {}
         }
         if let Some(ctx) = self.audio_ctx.take() {
             let _ = ctx.close();
-        }
-        for data in self.data_queue.borrow_mut().drain(..) {
-            data.close();
         }
     }
 
     /// Check if audio is configured.
     pub fn is_configured(&self) -> bool {
-        self.decoder.is_some()
+        self.backend.is_some()
     }
 
     pub fn has_error(&self) -> Option<String> {
-        self.error.borrow().clone()
+        match &self.backend {
+            Some(AudioBackend::WebCodecs { error, .. }) => error.borrow().clone(),
+            _ => None,
+        }
+    }
+
+    /// Get the number of decoded audio data items waiting in the queue.
+    pub fn queue_len(&self) -> usize {
+        match &self.backend {
+            Some(AudioBackend::WebCodecs { data_queue, .. }) => data_queue.borrow().len(),
+            Some(AudioBackend::Software { pcm_queue, .. }) => pcm_queue.len(),
+            None => 0,
+        }
     }
 }
 
@@ -229,4 +427,81 @@ impl Drop for AudioPipeline {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Downmix multi-channel audio to stereo.
+/// Input: deinterleaved channels. Output: 2 channels [left, right].
+/// Supports 5.1 (6ch), 5.0 (5ch), quad (4ch), 3.0 (3ch).
+fn downmix_to_stereo(channels: &[Vec<f32>], nch: usize) -> Vec<Vec<f32>> {
+    let len = channels[0].len();
+    let mut left = vec![0.0f32; len];
+    let mut right = vec![0.0f32; len];
+
+    match nch {
+        6 => {
+            // 5.1: L, C, R, SL, SR, LFE (standard AC-3 order for acmod=7 + LFE)
+            // Downmix: L' = L + 0.707*C + 0.707*SL, R' = R + 0.707*C + 0.707*SR
+            let cmix = 0.707f32;
+            let smix = 0.707f32;
+            for i in 0..len {
+                left[i] = channels[0][i] + cmix * channels[1][i] + smix * channels[3][i];
+                right[i] = channels[2][i] + cmix * channels[1][i] + smix * channels[4][i];
+            }
+        }
+        5 => {
+            // 5.0: L, C, R, SL, SR
+            let cmix = 0.707f32;
+            let smix = 0.707f32;
+            for i in 0..len {
+                left[i] = channels[0][i] + cmix * channels[1][i] + smix * channels[3][i];
+                right[i] = channels[2][i] + cmix * channels[1][i] + smix * channels[4][i];
+            }
+        }
+        4 => {
+            // Quad: L, R, SL, SR
+            let smix = 0.707f32;
+            for i in 0..len {
+                left[i] = channels[0][i] + smix * channels[2][i];
+                right[i] = channels[1][i] + smix * channels[3][i];
+            }
+        }
+        3 => {
+            // 3.0: L, C, R
+            let cmix = 0.707f32;
+            for i in 0..len {
+                left[i] = channels[0][i] + cmix * channels[1][i];
+                right[i] = channels[2][i] + cmix * channels[1][i];
+            }
+        }
+        1 => {
+            // Mono → duplicate to both channels
+            left.copy_from_slice(&channels[0]);
+            right.copy_from_slice(&channels[0]);
+        }
+        _ => {
+            // Unknown layout — just use first 2 channels
+            if nch >= 2 {
+                left.copy_from_slice(&channels[0]);
+                right.copy_from_slice(&channels[1]);
+            } else {
+                left.copy_from_slice(&channels[0]);
+                right.copy_from_slice(&channels[0]);
+            }
+        }
+    }
+
+    // Normalize to prevent clipping
+    let mut peak = 0.0f32;
+    for i in 0..len {
+        peak = peak.max(left[i].abs()).max(right[i].abs());
+    }
+    if peak > 1.0 {
+        let scale = 1.0 / peak;
+        for i in 0..len {
+            left[i] *= scale;
+            right[i] *= scale;
+        }
+    }
+
+    vec![left, right]
 }

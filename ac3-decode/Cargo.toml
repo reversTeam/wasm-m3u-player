@@ -1,0 +1,7 @@
+[package]
+name = "ac3-decode"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust AC-3 (Dolby Digital) and E-AC-3 (Dolby Digital Plus) decoder"
+
+[dependencies]

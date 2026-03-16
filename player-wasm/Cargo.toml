@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "WASM video player — headless API with WebCodecs + Canvas rendering"
 
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -18,6 +21,7 @@ console_error_panic_hook = "0.1"
 player-core = { path = "../player-core" }
 demuxer = { path = "../demuxer" }
 m3u-core = { path = "../m3u-core" }
+ac3-decode = { path = "../ac3-decode" }
 
 [dependencies.web-sys]
 version = "0.3"

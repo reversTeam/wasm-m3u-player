@@ -10,3 +10,6 @@ name = "player_core"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
+
+[dev-dependencies]
+serde_json = "1"

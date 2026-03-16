@@ -2,10 +2,19 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Request, RequestInit, RequestMode, ReadableStreamDefaultReader, Response};
 
-/// Information from an HTTP HEAD request.
+/// Information from an HTTP HEAD / probe request.
 pub struct HeadInfo {
     pub content_length: u64,
     pub supports_range: bool,
+}
+
+/// Result of a Range request — includes the actual data AND metadata.
+pub struct RangeResult {
+    pub data: Vec<u8>,
+    /// Total file size (from Content-Range header: bytes 0-N/TOTAL).
+    pub total_size: u64,
+    /// Whether the server actually returned 206 Partial Content.
+    pub is_partial: bool,
 }
 
 /// A streaming HTTP reader — opens a fetch request and reads chunks on demand.
@@ -76,11 +85,39 @@ impl StreamReader {
     }
 
     /// Fetch a specific byte range from the URL.
-    /// Returns the bytes and whether the server actually returned partial content (206).
     /// If the server ignores Range and returns 200, the full body is returned.
     pub async fn fetch_range(url: &str, start: u64, end: u64) -> Result<Vec<u8>, JsValue> {
+        let result = Self::fetch_range_ext(url, start, end).await?;
+        Ok(result.data)
+    }
+
+    /// Fetch a specific byte range with extended info (status, total size).
+    /// Used for Range probing — caller can check `is_partial` to know if server supports Range.
+    pub async fn fetch_range_ext(url: &str, start: u64, end: u64) -> Result<RangeResult, JsValue> {
         let range = format!("bytes={}-{}", start, end);
         let resp = do_fetch(url, "GET", Some(&range)).await?;
+
+        let is_partial = resp.status() == 206;
+
+        // Parse total file size from Content-Range: bytes 0-N/TOTAL
+        let total_size = resp
+            .headers()
+            .get("content-range")
+            .ok()
+            .flatten()
+            .and_then(|cr| {
+                // Format: "bytes 0-65535/123456789"
+                cr.split('/').last().and_then(|s| s.trim().parse::<u64>().ok())
+            })
+            .unwrap_or_else(|| {
+                // Fallback to Content-Length (for 200 responses)
+                resp.headers()
+                    .get("content-length")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+            });
 
         // Read the full body
         let array_buffer = JsFuture::from(
@@ -92,7 +129,23 @@ impl StreamReader {
         let mut bytes = vec![0u8; uint8.length() as usize];
         uint8.copy_to(&mut bytes);
 
-        Ok(bytes)
+        Ok(RangeResult {
+            data: bytes,
+            total_size,
+            is_partial,
+        })
+    }
+
+    /// Probe the server for Range support by requesting a small byte range.
+    /// Returns file size and whether the server actually supports Range (206).
+    /// More reliable than HEAD — actually tests the Range mechanism.
+    pub async fn probe_range(url: &str) -> Result<HeadInfo, JsValue> {
+        let result = Self::fetch_range_ext(url, 0, 1).await?;
+
+        Ok(HeadInfo {
+            content_length: result.total_size,
+            supports_range: result.is_partial,
+        })
     }
 
     /// Open a streaming fetch to the given URL.

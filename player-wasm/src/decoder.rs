@@ -107,9 +107,20 @@ impl VideoDecoderWrapper {
 
         let data = js_sys::Uint8Array::from(chunk.data.as_slice());
 
-        let init = EncodedVideoChunkInit::new(&data.buffer(), chunk.timestamp_us as i32, chunk_type);
+        // web-sys binds timestamp as i32, but WebCodecs expects microseconds
+        // which overflow i32 at ~35min. Workaround: set timestamp as f64 via Reflect.
+        let init = EncodedVideoChunkInit::new(&data.buffer(), 0_i32, chunk_type);
+        js_sys::Reflect::set(
+            init.as_ref(),
+            &"timestamp".into(),
+            &JsValue::from_f64(chunk.timestamp_us as f64),
+        )?;
         if chunk.duration_us > 0 {
-            init.set_duration(chunk.duration_us as u32);
+            js_sys::Reflect::set(
+                init.as_ref(),
+                &"duration".into(),
+                &JsValue::from_f64(chunk.duration_us as f64),
+            )?;
         }
 
         let encoded_chunk = EncodedVideoChunk::new(&init)?;

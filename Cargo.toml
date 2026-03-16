@@ -4,5 +4,6 @@ members = [
     "demuxer",
     "player-core",
     "player-wasm",
+    "ac3-decode",
 ]
 resolver = "2"
