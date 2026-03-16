@@ -249,55 +249,106 @@ h1 {
     transition: opacity 0.3s ease;
 }
 
-/* Seek row — full width */
+/* Seek row — full width multi-layer progress bar */
 .pc-seek-row {
-    padding: 4px 0;
+    padding: 8px 0 4px;
 }
 
-.pc-seek {
+.pc-seek-track {
+    position: relative;
     width: 100%;
-    -webkit-appearance: none;
-    appearance: none;
     height: 4px;
     border-radius: 2px;
-    background: rgba(255, 255, 255, 0.25);
-    outline: none;
+    background: rgba(255, 255, 255, 0.2);
     cursor: pointer;
     transition: height 0.15s ease;
 }
 
-.pc-seek:hover {
+.pc-seek-track:hover {
     height: 6px;
 }
 
-.pc-seek::-webkit-slider-thumb {
+/* Buffered portion — light grey */
+.pc-seek-buffered {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    background: rgba(255, 255, 255, 0.35);
+    border-radius: 2px;
+    pointer-events: none;
+    transition: width 0.1s linear;
+}
+
+/* Played/watched portion — accent color */
+.pc-seek-played {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    background: var(--accent, #e94560);
+    border-radius: 2px;
+    pointer-events: none;
+    transition: width 0.1s linear;
+}
+
+/* Thumb — draggable circle */
+.pc-seek-thumb {
+    position: absolute;
+    top: 50%;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--accent, #e94560);
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s, transform 0.1s;
+}
+
+.pc-seek-track:hover .pc-seek-thumb {
+    opacity: 1;
+}
+
+.pc-seek-track:hover .pc-seek-thumb:hover {
+    transform: translate(-50%, -50%) scale(1.3);
+}
+
+/* Hidden range input — overlays the track for click/drag handling */
+.pc-seek-input {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+    opacity: 0;
+}
+
+.pc-seek-input::-webkit-slider-thumb {
     -webkit-appearance: none;
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background: var(--accent, #e94560);
+    background: transparent;
     cursor: pointer;
-    border: none;
-    transition: transform 0.1s;
 }
 
-.pc-seek::-webkit-slider-thumb:hover {
-    transform: scale(1.3);
-}
-
-.pc-seek::-moz-range-thumb {
+.pc-seek-input::-moz-range-thumb {
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background: var(--accent, #e94560);
-    cursor: pointer;
+    background: transparent;
     border: none;
+    cursor: pointer;
 }
 
-.pc-seek::-moz-range-track {
-    height: 4px;
-    border-radius: 2px;
-    background: rgba(255, 255, 255, 0.25);
+.pc-seek-input::-moz-range-track {
+    background: transparent;
 }
 
 /* Controls row — play, time, spacer, volume, fullscreen */

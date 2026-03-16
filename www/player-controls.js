@@ -25,6 +25,7 @@ export class PlayerControls {
         this._volume = parseFloat(localStorage.getItem('player-volume') ?? '1');
         this._muted = localStorage.getItem('player-muted') === 'true';
         this._seeking = false;
+        this._bufferedMs = 0;
         this._hideTimer = null;
         this._controlsVisible = true;
 
@@ -63,17 +64,39 @@ export class PlayerControls {
         this._bottomBar = document.createElement('div');
         this._bottomBar.className = 'pc-bottom-bar';
 
-        // Seek bar (full-width row above controls)
+        // Seek bar — multi-layer progress (total / buffered / watched / thumb)
         this._seekRow = document.createElement('div');
         this._seekRow.className = 'pc-seek-row';
+
+        this._seekTrack = document.createElement('div');
+        this._seekTrack.className = 'pc-seek-track';
+
+        // Layer 1: buffered (grey)
+        this._seekBuffered = document.createElement('div');
+        this._seekBuffered.className = 'pc-seek-buffered';
+        this._seekTrack.appendChild(this._seekBuffered);
+
+        // Layer 2: watched/played (accent color)
+        this._seekPlayed = document.createElement('div');
+        this._seekPlayed.className = 'pc-seek-played';
+        this._seekTrack.appendChild(this._seekPlayed);
+
+        // Layer 3: thumb (draggable circle)
+        this._seekThumb = document.createElement('div');
+        this._seekThumb.className = 'pc-seek-thumb';
+        this._seekTrack.appendChild(this._seekThumb);
+
+        // Hidden range input for accessibility + easy drag handling
         this._seekBar = document.createElement('input');
         this._seekBar.type = 'range';
-        this._seekBar.className = 'pc-seek';
+        this._seekBar.className = 'pc-seek-input';
         this._seekBar.min = '0';
         this._seekBar.max = '1000';
         this._seekBar.value = '0';
         this._seekBar.step = '1';
-        this._seekRow.appendChild(this._seekBar);
+        this._seekTrack.appendChild(this._seekBar);
+
+        this._seekRow.appendChild(this._seekTrack);
         this._bottomBar.appendChild(this._seekRow);
 
         // Controls row
@@ -146,6 +169,7 @@ export class PlayerControls {
             this._seeking = true;
             const targetMs = Math.round((this._seekBar.value / 1000) * this._durationMs);
             this._updateTimeText(targetMs, this._durationMs);
+            this._updateSeekVisuals(targetMs);
         });
 
         this._seekBar.addEventListener('change', () => {
@@ -262,6 +286,7 @@ export class PlayerControls {
             this._updateTimeText(currentMs, this._durationMs);
             if (this._durationMs > 0) {
                 this._seekBar.value = String(Math.round((currentMs / this._durationMs) * 1000));
+                this._updateSeekVisuals(currentMs);
             }
         }
     }
@@ -270,6 +295,13 @@ export class PlayerControls {
     updateDuration(durationMs) {
         this._durationMs = durationMs;
         this._updateTimeText(this._currentMs, durationMs);
+        this._updateSeekVisuals(this._currentMs);
+    }
+
+    /** Update buffered amount (in ms or bytes — used for buffer bar) */
+    updateBuffered(bufferedMs) {
+        this._bufferedMs = bufferedMs;
+        this._updateSeekVisuals(this._currentMs);
     }
 
     /** Update playback status */
@@ -390,6 +422,17 @@ export class PlayerControls {
 
     _updateTimeText(currentMs, durationMs) {
         this._timeDisplay.textContent = `${this._formatTime(currentMs)} / ${this._formatTime(durationMs)}`;
+    }
+
+    /** Update visual layers of the seek bar (played + buffered percentages) */
+    _updateSeekVisuals(currentMs) {
+        if (this._durationMs <= 0) return;
+        const playedPct = Math.min((currentMs / this._durationMs) * 100, 100);
+        const bufferedPct = Math.min((this._bufferedMs / this._durationMs) * 100, 100);
+
+        this._seekPlayed.style.width = `${playedPct}%`;
+        this._seekBuffered.style.width = `${bufferedPct}%`;
+        this._seekThumb.style.left = `${playedPct}%`;
     }
 
     _setVolume(vol) {

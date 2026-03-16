@@ -1287,6 +1287,11 @@ impl Player {
         Ok(())
     }
 
+    /// Set audio volume (0.0 = muted, 1.0 = full).
+    pub fn set_volume(&self, volume: f64) {
+        self.audio_pipeline.set_volume(volume.clamp(0.0, 1.0));
+    }
+
     /// Stop playback and reset.
     pub fn stop(&mut self) {
         self.state.status = PlaybackStatus::Stopped;

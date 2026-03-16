@@ -17,6 +17,7 @@ let player = null;
 let controls = null;
 let rafId = null;
 let currentStatus = 'Idle';
+let totalFileBytes = 0;
 
 // --- Helpers ---
 function formatTime(ms) {
@@ -143,6 +144,7 @@ function handlePlayerEvent(event) {
         case 'DownloadProgress': {
             const received = event.received_bytes;
             const total = event.total_bytes;
+            if (total > 0) totalFileBytes = total;
             if (currentStatus === 'Loading' && controls) {
                 if (total > 0) {
                     const pct = Math.round((received / total) * 100);
@@ -153,6 +155,11 @@ function handlePlayerEvent(event) {
                     const mb = (received / 1048576).toFixed(1);
                     controls.showMessage(`Loading... ${mb} MB`);
                 }
+            }
+            // Update buffer bar (received bytes → estimated buffered duration)
+            if (controls && total > 0 && controls._durationMs > 0) {
+                const bufferedMs = (received / total) * controls._durationMs;
+                controls.updateBuffered(bufferedMs);
             }
             break;
         }
@@ -178,6 +185,11 @@ function handlePlayerEvent(event) {
             break;
 
         case 'BufferUpdate':
+            // buffered_ms is actually bytes — estimate buffered duration proportionally
+            if (controls && totalFileBytes > 0 && controls._durationMs > 0) {
+                const bufferedMs = (event.buffered_ms / totalFileBytes) * controls._durationMs;
+                controls.updateBuffered(bufferedMs);
+            }
             break;
 
         case 'Ended':
@@ -268,9 +280,14 @@ function setupControls() {
     });
 
     controls.on('volumechange', ({ volume, muted }) => {
-        // Volume is handled JS-side for now (WebAudio gain or future API)
-        console.log(`Volume: ${volume}, Muted: ${muted}`);
+        if (!player) return;
+        player.set_volume(muted ? 0 : volume);
     });
+
+    // Apply initial volume from localStorage
+    if (player) {
+        player.set_volume(controls.getVolume());
+    }
 }
 
 // --- Load Media ---
@@ -280,6 +297,7 @@ async function loadMedia() {
 
     hideError();
     stopRenderLoop();
+    totalFileBytes = 0;
 
     if (player) {
         player.destroy();
@@ -304,6 +322,8 @@ async function loadMedia() {
         }
 
         await player.play();
+        // Apply initial volume from controls (localStorage)
+        player.set_volume(controls.getVolume());
         startRenderLoop();
     } catch (e) {
         showError(`Load failed: ${e}`);

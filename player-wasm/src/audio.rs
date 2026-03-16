@@ -6,7 +6,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::{
     AudioBufferSourceNode, AudioContext, AudioData, AudioDataCopyToOptions, AudioDecoder,
     AudioDecoderConfig, AudioDecoderInit, AudioSampleFormat, EncodedAudioChunk,
-    EncodedAudioChunkInit, EncodedAudioChunkType,
+    EncodedAudioChunkInit, EncodedAudioChunkType, GainNode,
 };
 
 use demuxer::EncodedChunk;
@@ -44,6 +44,8 @@ enum AudioBackend {
 pub struct AudioPipeline {
     backend: Option<AudioBackend>,
     audio_ctx: Option<AudioContext>,
+    /// GainNode for volume control — all sources connect through this.
+    gain_node: Option<GainNode>,
     /// Next scheduled playback time in AudioContext seconds.
     next_play_time: f64,
 }
@@ -53,6 +55,7 @@ impl AudioPipeline {
         Self {
             backend: None,
             audio_ctx: None,
+            gain_node: None,
             next_play_time: 0.0,
         }
     }
@@ -69,6 +72,12 @@ impl AudioPipeline {
         // Create AudioContext (must be resumed after user interaction)
         let audio_ctx = AudioContext::new()?;
         self.next_play_time = audio_ctx.current_time();
+
+        // Create GainNode for volume control: source → gain → destination
+        let gain = audio_ctx.create_gain()?;
+        gain.connect_with_audio_node(&audio_ctx.destination())?;
+        self.gain_node = Some(gain);
+
         self.audio_ctx = Some(audio_ctx);
 
         // Check if this is an AC-3/E-AC-3 codec — use software decoder directly
@@ -313,7 +322,12 @@ impl AudioPipeline {
 
         let source: AudioBufferSourceNode = ctx.create_buffer_source()?;
         source.set_buffer(Some(&audio_buffer));
-        source.connect_with_audio_node(&ctx.destination())?;
+        // Route through gain node for volume control
+        if let Some(gain) = &self.gain_node {
+            source.connect_with_audio_node(gain)?;
+        } else {
+            source.connect_with_audio_node(&ctx.destination())?;
+        }
 
         let current_time = ctx.current_time();
         if self.next_play_time < current_time {
@@ -343,7 +357,12 @@ impl AudioPipeline {
 
         let source: AudioBufferSourceNode = ctx.create_buffer_source()?;
         source.set_buffer(Some(&audio_buffer));
-        source.connect_with_audio_node(&ctx.destination())?;
+        // Route through gain node for volume control
+        if let Some(gain) = &self.gain_node {
+            source.connect_with_audio_node(gain)?;
+        } else {
+            source.connect_with_audio_node(&ctx.destination())?;
+        }
 
         let current_time = ctx.current_time();
         if self.next_play_time < current_time {
@@ -362,6 +381,13 @@ impl AudioPipeline {
             .as_ref()
             .map(|ctx| ctx.current_time() * 1000.0)
             .unwrap_or(0.0)
+    }
+
+    /// Set volume (0.0 = muted, 1.0 = full volume).
+    pub fn set_volume(&self, volume: f64) {
+        if let Some(gain) = &self.gain_node {
+            gain.gain().set_value(volume as f32);
+        }
     }
 
     /// Suspend AudioContext.
@@ -396,6 +422,7 @@ impl AudioPipeline {
             }
             None => {}
         }
+        self.gain_node.take();
         if let Some(ctx) = self.audio_ctx.take() {
             let _ = ctx.close();
         }

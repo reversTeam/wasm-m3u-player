@@ -57,9 +57,12 @@ features = [
     "AudioSampleFormat",
     # Web Audio
     "AudioContext",
+    "BaseAudioContext",
     "AudioBuffer",
     "AudioBufferSourceNode",
     "AudioDestinationNode",
+    "GainNode",
+    "AudioParam",
     # Timing
     "Performance",
 ]
