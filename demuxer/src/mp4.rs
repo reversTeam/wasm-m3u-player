@@ -1,13 +1,65 @@
-use std::io::Cursor;
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::rc::Rc;
+use std::cell::Cell;
 
 use crate::types::*;
 
+/// A cursor wrapper that limits reads to a configurable byte boundary.
+///
+/// During MP4 header parsing, the synthetic buffer is `[download_data][moov]`.
+/// After parsing, we set the read limit to `download_len` so that sample reads
+/// beyond the actual mdat data fail with EOF instead of reading moov bytes
+/// as if they were sample data (which would produce corrupt frames).
+///
+/// The limit is stored in a shared `Rc<Cell<u64>>` so the caller can change it
+/// after `Mp4Reader::read_header()` has taken ownership of the cursor.
+pub struct LimitedCursor {
+    inner: Cursor<Vec<u8>>,
+    /// Shared read limit. Reads at positions >= this value return EOF.
+    /// u64::MAX means unlimited (used during header parsing).
+    limit: Rc<Cell<u64>>,
+}
+
+impl LimitedCursor {
+    fn new(data: Vec<u8>) -> (Self, Rc<Cell<u64>>) {
+        let limit = Rc::new(Cell::new(u64::MAX));
+        let cursor = LimitedCursor {
+            inner: Cursor::new(data),
+            limit: limit.clone(),
+        };
+        (cursor, limit)
+    }
+}
+
+impl Read for LimitedCursor {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let limit = self.limit.get();
+        let pos = self.inner.position();
+        if pos >= limit {
+            // Beyond the data limit — mimic EOF so read_exact returns UnexpectedEof
+            return Ok(0);
+        }
+        let remaining = (limit - pos) as usize;
+        let capped_len = buf.len().min(remaining);
+        self.inner.read(&mut buf[..capped_len])
+    }
+}
+
+impl Seek for LimitedCursor {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
 /// MP4 demuxer using the `mp4` crate.
 pub struct Mp4Demuxer {
-    reader: Option<mp4::Mp4Reader<Cursor<Vec<u8>>>>,
+    reader: Option<mp4::Mp4Reader<LimitedCursor>>,
     media_info: Option<MediaInfo>,
     /// Current sample indices per track (track_id -> next sample index, 1-based).
     sample_cursors: Vec<(u32, u32)>,
+    /// Handle to control the read limit on the internal cursor.
+    /// Set to download_len after parse_header to prevent reading moov as sample data.
+    read_limit: Option<Rc<Cell<u64>>>,
 }
 
 /// A top-level MP4 box found during scanning.
@@ -48,6 +100,21 @@ impl Mp4Demuxer {
             reader: None,
             media_info: None,
             sample_cursors: Vec::new(),
+            read_limit: None,
+        }
+    }
+
+    /// Set the read limit for sample data access.
+    ///
+    /// After calling `parse_header()` with a synthetic buffer that has moov
+    /// appended after the download data, call this with `download_len` to
+    /// prevent `read_sample()` from reading moov bytes as video/audio data.
+    ///
+    /// Reads at byte positions >= `limit` will return EOF, causing `read_sample()`
+    /// to fail gracefully instead of returning corrupt data.
+    pub fn set_data_limit(&mut self, limit: u64) {
+        if let Some(ref handle) = self.read_limit {
+            handle.set(limit);
         }
     }
 
@@ -403,11 +470,15 @@ impl Demuxer for Mp4Demuxer {
     }
 
     fn parse_header(&mut self, data: &[u8]) -> Result<MediaInfo, DemuxError> {
-        let cursor = Cursor::new(data.to_vec());
+        let (cursor, limit_handle) = LimitedCursor::new(data.to_vec());
         let size = data.len() as u64;
 
+        // During read_header, the limit is u64::MAX (unlimited) so moov can be read.
+        // After parsing, the caller should call set_data_limit(download_len) to
+        // prevent read_sample from accessing the moov appendage as sample data.
         let reader = mp4::Mp4Reader::read_header(cursor, size)
             .map_err(|e| DemuxError::InvalidData(format!("MP4 parse error: {}", e)))?;
+        self.read_limit = Some(limit_handle);
 
         let mut video_tracks = Vec::new();
         let mut audio_tracks = Vec::new();

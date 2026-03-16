@@ -50,6 +50,7 @@ dependencies = [
 name = "demuxer"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "matroska-demuxer",
  "mp4",
  "serde",

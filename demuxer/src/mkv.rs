@@ -1,5 +1,6 @@
 use std::io::Cursor;
 
+use bytes::Bytes;
 use matroska_demuxer::{Frame, MatroskaFile, TrackType};
 
 use crate::types::*;
@@ -116,10 +117,15 @@ pub struct MkvDemuxer {
     /// TimestampScale in nanoseconds (default 1_000_000 = 1ms per tick).
     /// Used to convert frame.timestamp (ticks) to microseconds.
     timestamp_scale_ns: u64,
+    /// Byte offset up to which scan_clusters has already scanned.
+    /// Used for incremental scanning: only scan data[last_scanned_offset..] on rebuild.
+    last_scanned_offset: usize,
     /// Raw buffer used during parse_header, kept for seek rewind.
     /// MatroskaFile has no rewind/into_inner, so we store the data
     /// to re-create the MatroskaFile when seeking.
-    raw_data: Option<Vec<u8>>,
+    /// Stored as `Bytes` so that cloning (e.g. in seek_to_keyframe) is O(1)
+    /// via atomic refcount instead of a full buffer copy.
+    raw_data: Option<Bytes>,
 }
 
 impl MkvDemuxer {
@@ -132,6 +138,7 @@ impl MkvDemuxer {
             frames_read: 0,
             seek_index: SeekIndex::new(),
             timestamp_scale_ns: 1_000_000, // default: 1ms per tick
+            last_scanned_offset: 0,
             raw_data: None,
         }
     }
@@ -164,6 +171,44 @@ impl MkvDemuxer {
         self.frames_read
     }
 
+    /// Get the pre-computed seek index (Cluster boundary offsets + timestamps).
+    pub fn get_seek_index(&self) -> &SeekIndex {
+        &self.seek_index
+    }
+
+    /// Transfer the seek index and scan offset from a previous demuxer instance.
+    /// Used during rebuild to avoid re-scanning already-known Cluster entries.
+    pub fn transfer_seek_state(&mut self, seek_index: SeekIndex, last_scanned_offset: usize) {
+        self.seek_index = seek_index;
+        self.last_scanned_offset = last_scanned_offset;
+    }
+
+    /// Get the byte offset up to which Clusters have been scanned.
+    pub fn last_scanned_offset(&self) -> usize {
+        self.last_scanned_offset
+    }
+
+    /// Find the last Cluster boundary (byte offset + timestamp_us) that starts
+    /// at or before the given byte offset. Uses the seek index built during parse_header.
+    ///
+    /// Returns `None` if the seek index is empty or all entries are past the offset.
+    pub fn find_cluster_before_offset(&self, byte_offset: u64) -> Option<&SeekEntry> {
+        if self.seek_index.entries.is_empty() {
+            return None;
+        }
+        // Binary search for the last entry with byte_offset <= target
+        let mut best: Option<&SeekEntry> = None;
+        for entry in &self.seek_index.entries {
+            if entry.byte_offset <= byte_offset {
+                best = Some(entry);
+            } else {
+                break; // entries are sorted by timestamp, but clusters are sequential
+                       // so byte offsets are also monotonically increasing
+            }
+        }
+        best
+    }
+
     /// Skip N frames (used after re-creating demuxer to resume position).
     pub fn skip_frames(&mut self, count: usize) -> Result<(), DemuxError> {
         let mkv = self
@@ -181,14 +226,22 @@ impl MkvDemuxer {
         Ok(())
     }
 
+    /// Get the timestamp scale in nanoseconds (default 1_000_000 = 1ms per tick).
+    /// Available after `parse_header` has been called.
+    pub fn timestamp_scale_ns(&self) -> u64 {
+        self.timestamp_scale_ns
+    }
+
     /// Scan raw data for MKV Cluster elements and extract their timestamps + offsets.
+    /// `start_offset` allows incremental scanning: only scan data[start_offset..].
+    /// The returned SeekIndex contains entries with ABSOLUTE byte offsets in `data`.
     ///
     /// Each Cluster starts with ID 0x1F43B675, followed by a VINT size,
     /// then contains a Timestamp element (ID 0xE7) with the cluster's
     /// timestamp in TimestampScale units.
-    fn scan_clusters_for_seek_index(data: &[u8], timestamp_scale_ns: u64) -> SeekIndex {
+    pub fn scan_clusters_for_seek_index(data: &[u8], timestamp_scale_ns: u64, start_offset: usize) -> SeekIndex {
         let mut entries = Vec::new();
-        let mut pos = 0;
+        let mut pos = start_offset;
 
         while pos + 4 < data.len() {
             // Search for Cluster ID: 0x1F43B675
@@ -282,7 +335,34 @@ impl MkvDemuxer {
     pub fn parse_header_streaming(&mut self, data: &[u8]) -> Result<MediaInfo, DemuxError> {
         let mut patched = data.to_vec();
         Self::neutralize_seekhead(&mut patched);
-        self.parse_header(&patched)
+        self.parse_header_from_vec(patched)
+    }
+
+    /// Like `parse_header_streaming` but takes ownership of the Vec, avoiding
+    /// the initial `data.to_vec()` copy. Use this when you already have an owned Vec
+    /// (e.g. from `build_mkv_buffer()`).
+    pub fn parse_header_streaming_owned(&mut self, mut data: Vec<u8>) -> Result<MediaInfo, DemuxError> {
+        Self::neutralize_seekhead(&mut data);
+        self.parse_header_from_vec(data)
+    }
+
+    /// Internal: parse header from an owned Vec. Stores a Bytes reference
+    /// for raw_data (O(1) clone) and creates the MatroskaFile cursor.
+    /// Total copies: 1 (Vec→Cursor needs its own copy since raw_data shares via Bytes).
+    fn parse_header_from_vec(&mut self, data: Vec<u8>) -> Result<MediaInfo, DemuxError> {
+        // Convert to Bytes (O(1) — takes ownership of the Vec's allocation)
+        let bytes = Bytes::from(data);
+        // Store for seek rewind — Bytes::clone is O(1) (atomic refcount)
+        self.raw_data = Some(bytes.clone());
+        // MatroskaFile<Cursor<Vec<u8>>> needs its own Vec — this is the ONE
+        // unavoidable copy per parse. With Bytes, raw_data above was free.
+        let vec_for_cursor = bytes.to_vec();
+        let cursor = Cursor::new(vec_for_cursor);
+
+        let mkv = MatroskaFile::open(cursor)
+            .map_err(|e| DemuxError::InvalidData(format!("MKV parse error: {}", e)))?;
+
+        self.finish_parse_header(mkv, &bytes)
     }
 
     /// Zero out the entire SeekHead element in raw EBML data.
@@ -356,19 +436,14 @@ impl MkvDemuxer {
     }
 }
 
-impl Demuxer for MkvDemuxer {
-    fn probe(data: &[u8]) -> bool {
-        data.len() >= 4 && data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3
-    }
-
-    fn parse_header(&mut self, data: &[u8]) -> Result<MediaInfo, DemuxError> {
-        let owned = data.to_vec();
-        let cursor = Cursor::new(owned.clone());
-        self.raw_data = Some(owned);
-
-        let mkv = MatroskaFile::open(cursor)
-            .map_err(|e| DemuxError::InvalidData(format!("MKV parse error: {}", e)))?;
-
+impl MkvDemuxer {
+    /// Common parse logic: extract tracks, build seek index, store the MatroskaFile.
+    /// `raw_bytes` is used for the seek index scan (passed as &[u8] slice from Bytes).
+    fn finish_parse_header(
+        &mut self,
+        mkv: MatroskaFile<Cursor<Vec<u8>>>,
+        raw_bytes: &[u8],
+    ) -> Result<MediaInfo, DemuxError> {
         let mut video_tracks = Vec::new();
         let mut audio_tracks = Vec::new();
         let mut video_track_ids = Vec::new();
@@ -420,12 +495,9 @@ impl Demuxer for MkvDemuxer {
         // Duration: info.duration is in nanoseconds scaled by TimestampScale
         let duration_us = mkv.info().duration().map(|d| {
             let timestamp_scale = mkv.info().timestamp_scale().get() as f64;
-            // duration is in scaled units, convert to microseconds
             ((d * timestamp_scale) / 1_000.0) as i64
         });
 
-        // Detect WebM vs MKV — matroska-demuxer doesn't expose doc_type directly,
-        // so we default to Mkv. WebM detection can be added via magic byte analysis.
         let container = ContainerFormat::Mkv;
 
         let info = MediaInfo {
@@ -435,18 +507,44 @@ impl Demuxer for MkvDemuxer {
             audio_tracks,
         };
 
-        // Build seek index from Cluster scanning before storing mkv
+        // Build seek index from Cluster scanning — incremental: only scan new bytes
         let timestamp_scale_ns = mkv.info().timestamp_scale().get();
-        let seek_index = Self::scan_clusters_for_seek_index(data, timestamp_scale_ns);
+        let new_entries = Self::scan_clusters_for_seek_index(
+            raw_bytes,
+            timestamp_scale_ns,
+            self.last_scanned_offset,
+        );
+
+        // Merge new entries into existing seek index
+        if !new_entries.entries.is_empty() {
+            self.seek_index.entries.extend(new_entries.entries);
+            // Deduplicate by byte_offset (keep first occurrence)
+            self.seek_index.entries.sort_by_key(|e| e.byte_offset);
+            self.seek_index.entries.dedup_by_key(|e| e.byte_offset);
+        }
+        self.last_scanned_offset = raw_bytes.len();
 
         self.media_info = Some(info.clone());
         self.video_track_ids = video_track_ids;
         self.audio_track_ids = audio_track_ids;
-        self.seek_index = seek_index;
         self.timestamp_scale_ns = timestamp_scale_ns;
         self.mkv = Some(mkv);
 
         Ok(info)
+    }
+}
+
+impl Demuxer for MkvDemuxer {
+    fn probe(data: &[u8]) -> bool {
+        data.len() >= 4 && data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3
+    }
+
+    fn parse_header(&mut self, data: &[u8]) -> Result<MediaInfo, DemuxError> {
+        // Delegate to the owned-Vec path. This adds one copy (data.to_vec()),
+        // but parse_header is called via the Demuxer trait with &[u8].
+        // For MKV streaming, prefer parse_header_streaming_owned() which
+        // takes Vec<u8> by value and avoids this copy.
+        self.parse_header_from_vec(data.to_vec())
     }
 
     fn next_chunk(&mut self) -> Result<Option<EncodedChunk>, DemuxError> {
@@ -541,13 +639,14 @@ impl Demuxer for MkvDemuxer {
 
         // Phase 2: Re-create MatroskaFile from stored raw data
         // MatroskaFile has no rewind/into_inner, so we use the copy saved during parse_header.
-        let data = self.raw_data.as_ref()
+        // raw_data is Bytes (refcounted), so .to_vec() is the only copy needed here.
+        let data_vec = self.raw_data.as_ref()
             .ok_or_else(|| DemuxError::InvalidData("No raw data stored for seek rewind".into()))?
-            .clone();
+            .to_vec();
         self.mkv.take(); // drop the consumed demuxer
 
         // Re-create MatroskaFile from the same data
-        let fresh_cursor = Cursor::new(data);
+        let fresh_cursor = Cursor::new(data_vec);
         let fresh_mkv = MatroskaFile::open(fresh_cursor)
             .map_err(|e| DemuxError::InvalidData(format!("MKV seek rewind error: {}", e)))?;
         self.mkv = Some(fresh_mkv);
@@ -1004,14 +1103,14 @@ mod tests {
 
     #[test]
     fn scan_clusters_empty_data() {
-        let idx = MkvDemuxer::scan_clusters_for_seek_index(&[], 1_000_000);
+        let idx = MkvDemuxer::scan_clusters_for_seek_index(&[], 1_000_000, 0);
         assert!(idx.is_empty());
     }
 
     #[test]
     fn scan_clusters_no_clusters() {
         let data = vec![0x00; 100];
-        let idx = MkvDemuxer::scan_clusters_for_seek_index(&data, 1_000_000);
+        let idx = MkvDemuxer::scan_clusters_for_seek_index(&data, 1_000_000, 0);
         assert!(idx.is_empty());
     }
 
@@ -1019,7 +1118,7 @@ mod tests {
     fn scan_clusters_single_cluster() {
         let data = make_cluster(0, 10);
         // timestamp_scale = 1_000_000 ns (1ms)
-        let idx = MkvDemuxer::scan_clusters_for_seek_index(&data, 1_000_000);
+        let idx = MkvDemuxer::scan_clusters_for_seek_index(&data, 1_000_000, 0);
         assert_eq!(idx.len(), 1);
         assert_eq!(idx.entries[0].timestamp_us, 0);
         assert_eq!(idx.entries[0].byte_offset, 0);
@@ -1038,7 +1137,7 @@ mod tests {
         data.extend(make_cluster(2000, 10));
 
         // timestamp_scale = 1_000_000 ns (1ms) → timestamp 1000 = 1_000_000 us
-        let idx = MkvDemuxer::scan_clusters_for_seek_index(&data, 1_000_000);
+        let idx = MkvDemuxer::scan_clusters_for_seek_index(&data, 1_000_000, 0);
         assert_eq!(idx.len(), 3);
         assert_eq!(idx.entries[0].timestamp_us, 0);
         assert_eq!(idx.entries[0].byte_offset, 0);
@@ -1053,7 +1152,7 @@ mod tests {
         // Some non-cluster data before the first cluster
         let mut data = vec![0x00; 50];
         data.extend(make_cluster(42, 5));
-        let idx = MkvDemuxer::scan_clusters_for_seek_index(&data, 1_000_000);
+        let idx = MkvDemuxer::scan_clusters_for_seek_index(&data, 1_000_000, 0);
         assert_eq!(idx.len(), 1);
         assert_eq!(idx.entries[0].byte_offset, 50);
         // timestamp 42 * scale 1_000_000ns / 1_000 = 42_000 us
@@ -1065,7 +1164,7 @@ mod tests {
         let data = make_cluster(500, 5);
         // Default MKV timestamp_scale = 1_000_000 ns (1ms)
         // Cluster timestamp = 500 → 500 * 1_000_000 / 1_000 = 500_000 us
-        let idx = MkvDemuxer::scan_clusters_for_seek_index(&data, 1_000_000);
+        let idx = MkvDemuxer::scan_clusters_for_seek_index(&data, 1_000_000, 0);
         assert_eq!(idx.entries[0].timestamp_us, 500_000);
     }
 

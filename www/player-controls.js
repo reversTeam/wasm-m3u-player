@@ -141,7 +141,7 @@ export class PlayerControls {
         this._fsBtn = document.createElement('button');
         this._fsBtn.className = 'pc-btn pc-fs-btn';
         this._fsBtn.title = 'Fullscreen';
-        this._fsBtn.innerHTML = '&#x26F6;'; // ⛶
+        this._fsBtn.innerHTML = PlayerControls._svgIcon('fullscreen-enter');
         this._controlsRow.appendChild(this._fsBtn);
 
         this._bottomBar.appendChild(this._controlsRow);
@@ -207,7 +207,9 @@ export class PlayerControls {
         // Fullscreen change (update icon)
         document.addEventListener('fullscreenchange', () => {
             const isFs = !!document.fullscreenElement;
-            this._fsBtn.innerHTML = isFs ? '&#x2716;' : '&#x26F6;'; // ✖ or ⛶
+            this._fsBtn.innerHTML = isFs
+                ? PlayerControls._svgIcon('fullscreen-exit')
+                : PlayerControls._svgIcon('fullscreen-enter');
             this._fsBtn.title = isFs ? 'Exit Fullscreen' : 'Fullscreen';
             this._trigger('fullscreenchange', { fullscreen: isFs });
         });
@@ -452,11 +454,55 @@ export class PlayerControls {
 
     _updateVolumeIcon() {
         if (this._muted || this._volume === 0) {
-            this._volumeBtn.innerHTML = '&#128263;'; // 🔇
+            this._volumeBtn.innerHTML = PlayerControls._svgIcon('volume-muted');
         } else if (this._volume < 0.5) {
-            this._volumeBtn.innerHTML = '&#128265;'; // 🔉
+            this._volumeBtn.innerHTML = PlayerControls._svgIcon('volume-low');
         } else {
-            this._volumeBtn.innerHTML = '&#128266;'; // 🔊
+            this._volumeBtn.innerHTML = PlayerControls._svgIcon('volume-high');
+        }
+    }
+
+    // =========================================================================
+    // SVG Icons (flat outline style)
+    // =========================================================================
+
+    static _svgIcon(name) {
+        const s = (d) =>
+            `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
+        switch (name) {
+            case 'fullscreen-enter':
+                return s(
+                    '<polyline points="15 3 21 3 21 9"/>' +
+                    '<polyline points="9 21 3 21 3 15"/>' +
+                    '<polyline points="21 15 21 21 15 21"/>' +
+                    '<polyline points="3 9 3 3 9 3"/>'
+                );
+            case 'fullscreen-exit':
+                return s(
+                    '<polyline points="4 14 10 14 10 20"/>' +
+                    '<polyline points="20 10 14 10 14 4"/>' +
+                    '<polyline points="14 20 14 14 20 14"/>' +
+                    '<polyline points="10 4 10 10 4 10"/>'
+                );
+            case 'volume-high':
+                return s(
+                    '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none"/>' +
+                    '<path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>' +
+                    '<path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>'
+                );
+            case 'volume-low':
+                return s(
+                    '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none"/>' +
+                    '<path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>'
+                );
+            case 'volume-muted':
+                return s(
+                    '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none"/>' +
+                    '<line x1="23" y1="9" x2="17" y2="15"/>' +
+                    '<line x1="17" y1="9" x2="23" y2="15"/>'
+                );
+            default:
+                return '';
         }
     }
 

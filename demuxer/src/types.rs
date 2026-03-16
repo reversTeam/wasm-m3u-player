@@ -147,6 +147,17 @@ impl SeekIndex {
     pub fn last(&self) -> Option<&SeekEntry> {
         self.entries.last()
     }
+
+    /// Merge entries from another SeekIndex, deduplicating by byte_offset.
+    /// The result is sorted by byte_offset.
+    pub fn merge(&mut self, other: SeekIndex) {
+        if other.entries.is_empty() {
+            return;
+        }
+        self.entries.extend(other.entries);
+        self.entries.sort_by_key(|e| e.byte_offset);
+        self.entries.dedup_by_key(|e| e.byte_offset);
+    }
 }
 
 /// Trait for container format demuxers.

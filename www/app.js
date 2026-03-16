@@ -1,4 +1,4 @@
-import init, { Player } from './pkg/player.js';
+import init, { Player, player_is_seeking } from './pkg/player.js';
 import { PlayerControls } from './player-controls.js';
 
 // --- DOM Elements ---
@@ -67,6 +67,12 @@ function startRenderLoop() {
     stopRenderLoop();
     function tick() {
         if (!player) return;
+        // Skip render_tick during async seek — avoids RefCell aliasing panic
+        // (seek holds &mut self across .await while rAF fires render_tick)
+        if (player_is_seeking()) {
+            rafId = requestAnimationFrame(tick);
+            return;
+        }
         try {
             const shouldContinue = player.render_tick();
             if (shouldContinue) {

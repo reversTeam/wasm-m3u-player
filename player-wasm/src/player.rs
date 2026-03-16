@@ -1,10 +1,23 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 use web_sys::console;
+
+// Thread-local seeking flag — checked by JS before calling render_tick().
+// This avoids the RefCell aliasing panic when seek() (async &mut self)
+// holds the wasm-bindgen borrow across .await while rAF fires render_tick().
+thread_local! {
+    static SEEKING: Cell<bool> = Cell::new(false);
+}
+
+/// Check if a seek is in progress. Call from JS before render_tick().
+#[wasm_bindgen]
+pub fn player_is_seeking() -> bool {
+    SEEKING.with(|s| s.get())
+}
 
 use demuxer::{detect_format, find_cluster_offset, ContainerFormat, Demuxer, EncodedChunk, MkvDemuxer, MoovLocation, Mp4Demuxer, SeekIndex};
 use m3u_core::{parse as parse_m3u, Playlist};
@@ -49,8 +62,16 @@ pub struct Player {
     chunk_queue: VecDeque<EncodedChunk>,
     /// MP4 demuxer resume cursors (track_id, sample_index).
     mp4_cursors: Option<Vec<(u32, u32)>>,
+    /// Cached MP4 demuxer — avoids re-parse when no new data arrived.
+    mp4_demuxer: Option<Mp4Demuxer>,
+    /// Data length when the cached MP4 demuxer was created.
+    mp4_cache_data_len: usize,
     /// MKV demuxer resume position (number of frames already read).
     mkv_frames_read: usize,
+    /// Timestamp (in microseconds) of the last frame demuxed from MKV.
+    /// Used to optimize rebuild: instead of skip_frames(N_total), we seek to the
+    /// Cluster containing this timestamp and only skip within-Cluster frames.
+    mkv_last_demuxed_ts_us: i64,
     /// Cached MKV demuxer — avoids expensive re-parse + frame-skip on every try_demux_more.
     mkv_demuxer: Option<MkvDemuxer>,
     /// Saved MKV header bytes (EBML + Segment Info + Tracks, up to first Cluster).
@@ -60,6 +81,12 @@ pub struct Player {
     /// Used to build incremental synthetic buffers (header + new data only) instead of
     /// expensive O(n) skip_frames when recreating the demuxer.
     mkv_cache_created_at: usize,
+    /// How far we've scanned the download buffer for Cluster entries (for seek_index updates).
+    /// Tracks offset in `download.data` — reset when download changes (seek, new stream).
+    mkv_cluster_scan_offset: usize,
+    /// TimestampScale in nanoseconds, copied from the first successful MKV parse.
+    /// Used to scan new clusters in the download buffer without needing the demuxer.
+    mkv_timestamp_scale_ns: u64,
     /// Data length at last demux session (avoid re-demuxing same data).
     last_demux_data_len: usize,
 
@@ -100,6 +127,31 @@ pub struct Player {
 
     // --- Sync stats emission ---
     sync_stats_frame_counter: u64,
+    /// Debug: tick counter for diagnostic logging
+    debug_tick: u64,
+
+    // --- Performance telemetry (T5) ---
+    /// Accumulated timing per render_tick phase over the reporting window.
+    perf_demux_ms: f64,
+    perf_decode_ms: f64,
+    perf_sync_ms: f64,
+    perf_total_ms: f64,
+    /// Max single-tick time in the reporting window.
+    perf_max_tick_ms: f64,
+    /// Number of ticks in current reporting window.
+    perf_tick_count: u64,
+    /// Number of MKV demuxer rebuilds in reporting window.
+    perf_rebuild_count: u64,
+    /// Whether last rebuild used synthetic buffer.
+    perf_last_synthetic: bool,
+    /// Size of last rebuild buffer in KB.
+    perf_last_buf_kb: usize,
+    /// Number of video frames actually rendered in reporting window.
+    perf_rendered_frames: u64,
+    /// Accumulated "other" time (audio pump, events, buffer state) in window.
+    perf_other_ms: f64,
+    /// Number of slow ticks (>8ms) in window.
+    perf_slow_ticks: u64,
 
     // --- Seek guard ---
     /// Incremented on each seek() call. If a seek finds the generation has changed
@@ -107,9 +159,11 @@ pub struct Player {
     seek_generation: u32,
 
     // --- Playback timing ---
-    /// `performance.now()` at the moment play() is called, adjusted for seek.
-    /// Clock = now_ms() - playback_start_time. After seek to T ms,
-    /// playback_start_time = now_ms() - T so clock starts at T.
+    /// Master clock origin, in the same time-space as `master_now_ms()`.
+    /// When audio is configured, this uses AudioContext.currentTime (sample-accurate).
+    /// Fallback: performance.now() when no audio is available.
+    /// Clock = master_now_ms() - playback_start_time. After seek to T ms,
+    /// playback_start_time = master_now_ms() - T so clock starts at T.
     playback_start_time: f64,
     /// Set once the clock has been re-anchored to the first decoded frame's PTS.
     /// Prevents the initial WebCodecs latency from causing mass frame drops.
@@ -123,6 +177,12 @@ pub struct Player {
 
     // --- Decoder config (stored for reconfiguration on seek/error recovery) ---
     demuxer_media_info: Option<demuxer::MediaInfo>,
+    /// Keyframe chunk waiting for recovery: stored here so it doesn't block the
+    /// chunk_queue (which would prevent audio decoding). When the decoded frame
+    /// queue drains to 0, step 2a reconfigures the decoder and feeds this keyframe.
+    pending_recovery_keyframe: Option<EncodedChunk>,
+    /// Tick count since video_dead was first detected (for timeout fallback).
+    video_dead_since_tick: u64,
 
     // --- Playlist ---
     playlist: Option<Playlist>,
@@ -149,10 +209,15 @@ impl Player {
             demuxer_format: None,
             chunk_queue: VecDeque::new(),
             mp4_cursors: None,
+            mp4_demuxer: None,
+            mp4_cache_data_len: 0,
             mkv_frames_read: 0,
+            mkv_last_demuxed_ts_us: 0,
             mkv_demuxer: None,
             mkv_header_bytes: None,
             mkv_cache_created_at: 0,
+            mkv_cluster_scan_offset: 0,
+            mkv_timestamp_scale_ns: 1_000_000,
             last_demux_data_len: 0,
             current_url: None,
             server_supports_range: false,
@@ -161,6 +226,19 @@ impl Player {
             last_buffer_update_ms: 0.0,
             buffering_since_ms: None,
             sync_stats_frame_counter: 0,
+            debug_tick: 0,
+            perf_demux_ms: 0.0,
+            perf_decode_ms: 0.0,
+            perf_sync_ms: 0.0,
+            perf_total_ms: 0.0,
+            perf_max_tick_ms: 0.0,
+            perf_tick_count: 0,
+            perf_rebuild_count: 0,
+            perf_last_synthetic: false,
+            perf_last_buf_kb: 0,
+            perf_rendered_frames: 0,
+            perf_other_ms: 0.0,
+            perf_slow_ticks: 0,
             seek_generation: 0,
             moov_data: None,
             mdat_offset: 0,
@@ -173,6 +251,8 @@ impl Player {
             skip_frames_before_us: None,
             pre_seek_status: None,
             demuxer_media_info: None,
+            pending_recovery_keyframe: None,
+            video_dead_since_tick: 0,
             playlist: None,
             playlist_index: 0,
         })
@@ -217,8 +297,13 @@ impl Player {
         self.download = SharedDownload::new();
         self.header_parsed = false;
         self.chunk_queue.clear();
+        self.pending_recovery_keyframe = None;
+            self.video_dead_since_tick = 0;
         self.mp4_cursors = None;
+        self.mp4_demuxer = None;
+        self.mp4_cache_data_len = 0;
         self.mkv_frames_read = 0;
+        self.mkv_last_demuxed_ts_us = 0;
         self.mkv_demuxer = None;
         self.last_demux_data_len = 0;
         self.moov_data = None;
@@ -608,6 +693,8 @@ impl Player {
 
         // Build seek index (from Cluster scanning done during parse_header)
         self.seek_index = demuxer.build_seek_index();
+        self.mkv_timestamp_scale_ns = demuxer.timestamp_scale_ns();
+        self.mkv_cluster_scan_offset = dl_data.len();
         console::log_1(&format!(
             "[player] MKV SeekIndex: {} entries", self.seek_index.len()
         ).into());
@@ -898,8 +985,9 @@ impl Player {
         }
 
         if self.state.status == PlaybackStatus::Paused {
-            // Resume from pause: adjust clock so it continues from current_time_ms
-            self.playback_start_time = now_ms() - self.state.current_time_ms as f64;
+            // Resume from pause: adjust clock so it continues from current_time_ms.
+            // Use master_now_ms() (audio clock when available) for drift-free sync.
+            self.playback_start_time = self.master_now_ms() - self.state.current_time_ms as f64;
             // Reset audio schedule so new buffers are scheduled from AudioContext's
             // current time (which was frozen during suspend)
             if self.audio_pipeline.is_configured() {
@@ -907,8 +995,8 @@ impl Player {
             }
         } else {
             // Fresh start from Ready state
-            self.playback_start_time = now_ms();
-            self.av_sync.set_start_offset(0.0);
+            self.playback_start_time = self.master_now_ms();
+            self.av_sync.resync_timer(now_ms());
             self.clock_synced_to_first_frame = false;
             self.skip_frames_before_us = None;
         }
@@ -938,6 +1026,25 @@ impl Player {
             return true;
         }
 
+        let tick_t0 = now_ms();
+        self.debug_tick += 1;
+        let _dtick = self.debug_tick;
+
+        // Debug: log state every tick for the first 60 ticks
+        if _dtick <= 60 {
+            let vq = self.video_decoder.queue_len();
+            let cq = self.chunk_queue.len();
+            let verr = self.video_decoder.has_error().is_some();
+            let clock = self.clock_ms();
+            let peek_pts = self.video_decoder.peek_timestamp_us()
+                .map(|p| format!("{:.1}ms", p / 1000.0))
+                .unwrap_or_else(|| "none".into());
+            console::log_1(&format!(
+                "[T{}] clock={:.1}ms vq={} cq={} verr={} synced={} peek={}",
+                _dtick, clock, vq, cq, verr, self.clock_synced_to_first_frame, peek_pts
+            ).into());
+        }
+
         // 0. Drain any pending prefetch data into buffers
         if self.range_buffer.is_some() {
             let drained = self.drain_prefetch();
@@ -948,33 +1055,195 @@ impl Player {
         }
 
         // 1. Demux more chunks if queue is low
+        let demux_t0 = now_ms();
         if self.chunk_queue.len() < self.config.min_chunk_queue {
             self.try_demux_more();
         }
+        let demux_ms = now_ms() - demux_t0;
 
         // 2. Feed encoded chunks to decoders (batch)
-        //    Once a decoder enters an error state, stop feeding it to avoid
-        //    flooding the UI with the same error on every frame.
+        //    If a decoder enters an error state, try to recover on next keyframe.
+        let decode_t0 = now_ms();
         let mut decoded = 0;
-        let video_dead = self.video_decoder.has_error().is_some();
+        let mut video_dead = self.video_decoder.has_error().is_some();
         let audio_dead = self.audio_pipeline.has_error().is_some();
+
+        // 2a. Video decoder recovery — DEFERRED strategy.
+        //
+        //     When the decoder enters an error state, it may still have valid
+        //     decoded frames in its output queue (frames decoded BEFORE the error).
+        //     reconfigure() destroys these frames. So we MUST wait until the
+        //     renderer has consumed all remaining frames before reconfiguring.
+        //
+        //     The keyframe needed for recovery is stored in `pending_recovery_keyframe`
+        //     (set by the decode loop below), NOT in chunk_queue — this avoids blocking
+        //     audio chunk decoding.
+        //
+        //     Flow:
+        //     - video_dead + queue_len > 0  → do nothing, let renderer drain good frames
+        //     - video_dead + queue_len == 0 + pending keyframe → reconfigure & decode it
+        if video_dead {
+            // Track how long we've been in video_dead state
+            if self.video_dead_since_tick == 0 {
+                self.video_dead_since_tick = _dtick;
+            }
+            let dead_ticks = _dtick - self.video_dead_since_tick;
+            let remaining_frames = self.video_decoder.queue_len();
+
+            // Diagnostic: log every tick while video_dead (first 30 ticks of dead state)
+            if dead_ticks <= 30 {
+                let peek = self.video_decoder.peek_timestamp_us();
+                let clock = self.clock_ms();
+                console::log_1(&format!(
+                    "[recovery] dead+{} vq={} pending_kf={} clock={:.1}ms peek={:?} tick={}",
+                    dead_ticks, remaining_frames,
+                    self.pending_recovery_keyframe.is_some(),
+                    clock, peek.map(|p| format!("{:.1}ms", p / 1000.0)), _dtick
+                ).into());
+            }
+
+            // Recovery trigger: either vq drained to 0, or timeout (60 ticks = ~1s)
+            let should_recover = remaining_frames == 0 || dead_ticks >= 60;
+
+            if should_recover && self.pending_recovery_keyframe.is_some() {
+                let kf_chunk = self.pending_recovery_keyframe.take().unwrap();
+                if dead_ticks >= 60 && remaining_frames > 0 {
+                    console::log_1(&format!(
+                        "[recovery] TIMEOUT after {} ticks, force-flushing {} undrained frames",
+                        dead_ticks, remaining_frames
+                    ).into());
+                }
+                // Same approach as seek: close old decoder, create brand new wrapper.
+                self.video_decoder.close();
+                self.video_decoder = VideoDecoderWrapper::new();
+                if let Some(ref media_info) = self.demuxer_media_info {
+                    if let Some(vt) = media_info.video_tracks.first() {
+                        match self.video_decoder.configure(
+                            &vt.codec_string,
+                            vt.width,
+                            vt.height,
+                            Some(&vt.codec_config),
+                        ) {
+                            Ok(()) => {
+                                console::log_1(&format!(
+                                    "[recovery] NEW decoder OK, feeding kf ts={}ms",
+                                    kf_chunk.timestamp_us / 1000
+                                ).into());
+                                match self.video_decoder.decode(&kf_chunk) {
+                                    Ok(()) => {
+                                        video_dead = false;
+                                        self.video_dead_since_tick = 0;
+                                        console::log_1(
+                                            &"[recovery] SUCCESS — video_dead=false".into()
+                                        );
+                                        // Re-anchor clock and frame_timer to next decoded frame PTS
+                                        self.clock_synced_to_first_frame = false;
+                                        self.av_sync.resync_timer(now_ms());
+                                    }
+                                    Err(e) => {
+                                        console::log_1(&format!(
+                                            "[recovery] kf decode FAILED: {:?}", e
+                                        ).into());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                console::log_1(&format!(
+                                    "[recovery] configure FAILED: {:?}", e
+                                ).into());
+                            }
+                        }
+                    }
+                }
+            }
+            // else: no keyframe captured yet — decode loop below will find one.
+        } else {
+            self.video_dead_since_tick = 0;
+        }
+
+        // Throttle video decoding based on TWO signals:
+        // 1. Our output frame queue (GPU-backed VideoFrame textures — max 6)
+        // 2. WebCodecs internal decode queue (pending decode ops — max 3)
+        // Audio MUST keep flowing even when video is throttled — audio chunks are tiny
+        // and have no GPU impact. We defer video chunks and re-queue them after the loop.
+        const MAX_DECODED_VQ: usize = 6;   // decoded frames in our queue
+        const MAX_DECODE_QUEUE: u32 = 3;    // pending decodes in WebCodecs
+        let mut deferred_video: Vec<EncodedChunk> = Vec::new();
+
         while decoded < self.config.decode_batch_size {
             if let Some(chunk) = self.chunk_queue.pop_front() {
                 if chunk.is_video {
+                    // Back-pressure: defer video chunks when either queue is saturated,
+                    // but DON'T stop the loop — audio behind this chunk must keep flowing.
+                    let vq_full = self.video_decoder.queue_len() >= MAX_DECODED_VQ;
+                    let dq_full = self.video_decoder.decode_queue_size() >= MAX_DECODE_QUEUE;
+                    if (vq_full || dq_full) && !video_dead {
+                        deferred_video.push(chunk);
+                        decoded += 1;
+                        continue;
+                    }
                     if video_dead {
-                        // Skip — decoder is dead
-                    } else if let Err(e) = self.video_decoder.decode(&chunk) {
-                        console::log_1(
-                            &format!(
-                                "[decode] Video FAIL: ts={}us, kf={}, data_len={}, err={:?}",
-                                chunk.timestamp_us, chunk.is_keyframe, chunk.data.len(), e
-                            )
-                            .into(),
-                        );
-                        self.emit_event(&PlayerEvent::Error {
-                            message: format!("Video decode error: {:?}", e),
-                            recoverable: true,
-                        });
+                        if chunk.is_keyframe && self.pending_recovery_keyframe.is_none() {
+                            // Capture the first keyframe for deferred recovery.
+                            // Stored OUTSIDE chunk_queue so audio keeps flowing.
+                            if _dtick <= 60 {
+                                console::log_1(&format!(
+                                    "[T{}] CAPTURED kf for recovery: ts={}ms",
+                                    _dtick, chunk.timestamp_us / 1000
+                                ).into());
+                            }
+                            self.pending_recovery_keyframe = Some(chunk);
+                        } else {
+                            // Non-keyframe (or we already have a pending kf): discard
+                            if _dtick <= 60 {
+                                console::log_1(&format!(
+                                    "[T{}] SKIP dead: V ts={}ms kf={}", _dtick, chunk.timestamp_us / 1000, chunk.is_keyframe
+                                ).into());
+                            }
+                        }
+                    } else {
+                        if _dtick <= 60 && decoded < 10 {
+                            console::log_1(&format!(
+                                "[T{}] FED V: ts={}ms kf={} len={}",
+                                _dtick, chunk.timestamp_us / 1000, chunk.is_keyframe, chunk.data.len()
+                            ).into());
+                        }
+                        if let Err(e) = self.video_decoder.decode(&chunk) {
+                            let err_msg = format!("{:?}", e);
+                            // Check if this is "key frame required" — the decoder is still
+                            // valid, it just rejected this delta frame. Skip it and wait
+                            // for the next keyframe instead of triggering heavy recovery.
+                            let is_keyframe_error = err_msg.contains("key frame")
+                                || err_msg.contains("Key frame")
+                                || err_msg.contains("keyframe");
+                            if is_keyframe_error {
+                                console::log_1(
+                                    &format!(
+                                        "[T{}] Video SKIP (need kf): ts={}ms, kf={}",
+                                        _dtick, chunk.timestamp_us / 1000, chunk.is_keyframe
+                                    )
+                                    .into(),
+                                );
+                                // Don't set video_dead — decoder is still operational.
+                                // Just skip delta frames until next keyframe arrives.
+                                // The keyframe will reset the decoder's internal reference state.
+                            } else {
+                                console::log_1(
+                                    &format!(
+                                        "[T{}] Video FAIL: ts={}ms, kf={}, data_len={}, err={}",
+                                        _dtick, chunk.timestamp_us / 1000, chunk.is_keyframe, chunk.data.len(), err_msg
+                                    )
+                                    .into(),
+                                );
+                                // Real error — enter recovery cycle
+                                self.video_decoder.set_error(err_msg.clone());
+                                video_dead = true;
+                                self.emit_event(&PlayerEvent::Error {
+                                    message: format!("Video decode error: {}", err_msg),
+                                    recoverable: true,
+                                });
+                            }
+                        }
                     }
                 } else if chunk.is_audio && self.audio_pipeline.is_configured() {
                     if audio_dead {
@@ -999,7 +1268,15 @@ impl Player {
             }
         }
 
+        // Re-queue deferred video chunks at the front (preserve order)
+        for chunk in deferred_video.into_iter().rev() {
+            self.chunk_queue.push_front(chunk);
+        }
+
+        let decode_ms = now_ms() - decode_t0;
+
         // 3. Get the master clock
+        let sync_t0 = now_ms();
         let mut clock_ms = self.clock_ms();
 
         // 3a. Discard stale frames from the decoder pipeline after SkipToKeyframe.
@@ -1032,41 +1309,56 @@ impl Player {
         if !self.clock_synced_to_first_frame {
             if let Some(pts_us) = self.video_decoder.peek_timestamp_us() {
                 let pts_ms = pts_us / 1000.0;
+                let master_now = self.master_now_ms();
                 // Re-anchor: at this instant, the clock should equal pts_ms
-                self.playback_start_time = now_ms() - pts_ms;
+                self.playback_start_time = master_now - pts_ms;
                 clock_ms = pts_ms;
                 self.clock_synced_to_first_frame = true;
                 console::log_1(&format!(
-                    "[sync] clock synced to first frame PTS={}ms (decoder latency={}ms)",
-                    pts_ms, now_ms() - self.playback_start_time - pts_ms
+                    "[T{}] CLOCK ANCHOR: PTS={:.1}ms, master_now={:.1}, start_time={:.1}",
+                    _dtick, pts_ms, master_now, self.playback_start_time
                 ).into());
             }
         }
 
-        // 4. Render video frames with A/V sync
+        // 4. Render video frames with A/V sync (ffplay-style frame_timer algorithm)
+        //
+        // Unlike the old approach (compare PTS vs clock with fixed thresholds),
+        // we now use ffplay's frame_timer accumulator. The sync engine tracks
+        // *when* each frame should be displayed on the wall clock, adjusting
+        // the delay based on A/V drift. This prevents timing error accumulation.
+        //
+        // The caller loop: for each frame, call decide(). On Render, keep it
+        // as best_frame but continue scanning (catch-up). On Drop, discard and
+        // continue. On Hold, stop — wait for next rAF tick.
+        let wall_now = now_ms();
+        let mut best_frame: Option<web_sys::VideoFrame> = None;
         loop {
             if let Some(pts_us) = self.video_decoder.peek_timestamp_us() {
                 let pts_ms = pts_us / 1000.0;
-                let action = self.av_sync.should_render_frame(pts_ms, clock_ms);
+                let action = self.av_sync.decide(pts_ms, clock_ms, wall_now);
 
                 // Diagnostic logging for first ~30 sync decisions
                 let (r, d, h, _s) = self.av_sync.stats();
                 let total = r + d + h;
                 if total <= 30 {
                     console::log_1(&format!(
-                        "[sync-dbg] #{}: pts={:.1}ms, clock={:.1}ms, diff={:.1}ms → {:?} (q={})",
-                        total, pts_ms, clock_ms, pts_ms - clock_ms, action,
+                        "[sync-dbg] #{}: pts={:.1}ms, clock={:.1}ms, diff={:.1}ms, now={:.1} → {:?} (q={})",
+                        total, pts_ms, clock_ms, pts_ms - clock_ms, wall_now, action,
                         self.video_decoder.queue_len()
                     ).into());
                 }
 
                 match action {
                     SyncAction::Render => {
+                        // Take the frame but DON'T render yet — check if a newer
+                        // frame is also renderable (catch-up after decode latency).
                         if let Some(frame) = self.video_decoder.take_frame() {
-                            let _ = self.renderer.render_frame(&frame);
-                            frame.close();
+                            if let Some(old) = best_frame.replace(frame) {
+                                old.close(); // Superseded by newer renderable frame
+                            }
                         }
-                        break; // One rendered frame per tick
+                        // Continue scanning — next frame might also be renderable
                     }
                     SyncAction::Drop => {
                         if let Some(frame) = self.video_decoder.take_frame() {
@@ -1078,42 +1370,62 @@ impl Player {
                         // Too many consecutive drops — the clock is way ahead of
                         // frame PTS. Flush decoded frames AND re-anchor the clock
                         // to the next decoded frame to break the drop cascade.
-                        console::log_1(&"[sync] SkipToKeyframe — flushing decoded frames + re-anchoring clock".into());
+                        //
+                        // SAFETY: limit the scan to keyframes within 5s of the current
+                        // clock to prevent catastrophic jumps (e.g., draining 2048 chunks
+                        // spanning 100+ seconds of content). If no close keyframe is found,
+                        // just re-anchor the clock without skipping — the next frame will
+                        // be rendered even if it's "old".
+                        console::log_1(&format!(
+                            "[sync] SkipToKeyframe — clock={:.1}ms, flushing decoded frames",
+                            clock_ms
+                        ).into());
                         self.video_decoder.flush_queue();
 
-                        // Also skip undecoded video chunks in the queue to the next
-                        // keyframe. Audio chunks are kept (they don't depend on
-                        // video keyframe boundaries).
+                        let max_skip_us = (clock_ms + 5_000.0) * 1000.0; // 5s ahead max
                         let mut skipped_chunks = 0;
                         let mut next_kf_pts_us: Option<f64> = None;
-                        let mut kept_audio = VecDeque::new();
+                        let mut kept_chunks = VecDeque::new();
                         while let Some(chunk) = self.chunk_queue.pop_front() {
                             if chunk.is_audio {
-                                // Keep audio chunks (skip subtitles and other non-video tracks)
-                                kept_audio.push_back(chunk);
-                            } else if chunk.is_keyframe {
-                                // Found next video keyframe — record its PTS and put it back
-                                next_kf_pts_us = Some(chunk.timestamp_us as f64);
-                                self.chunk_queue.push_front(chunk);
-                                break;
+                                kept_chunks.push_back(chunk);
+                            } else if chunk.is_video && chunk.is_keyframe {
+                                // Found next video keyframe — check if it's within range
+                                if (chunk.timestamp_us as f64) <= max_skip_us {
+                                    next_kf_pts_us = Some(chunk.timestamp_us as f64);
+                                    self.chunk_queue.push_front(chunk);
+                                    break;
+                                } else {
+                                    // Keyframe too far ahead — put it back, stop scanning
+                                    console::log_1(&format!(
+                                        "[sync] SkipToKeyframe: next kf at {}ms too far (clock={:.1}ms), re-anchoring instead",
+                                        chunk.timestamp_us / 1000, clock_ms
+                                    ).into());
+                                    self.chunk_queue.push_front(chunk);
+                                    // Re-insert all kept chunks too
+                                    while let Some(c) = kept_chunks.pop_back() {
+                                        self.chunk_queue.push_front(c);
+                                    }
+                                    kept_chunks.clear(); // Already re-inserted
+                                    break;
+                                }
                             } else {
+                                // Video non-keyframe — discard
                                 skipped_chunks += 1;
                             }
                         }
                         // Re-insert audio chunks at the front
-                        while let Some(audio) = kept_audio.pop_back() {
-                            self.chunk_queue.push_front(audio);
+                        while let Some(c) = kept_chunks.pop_back() {
+                            self.chunk_queue.push_front(c);
                         }
                         if skipped_chunks > 0 {
                             console::log_1(&format!(
-                                "[sync] skipped {} non-keyframe chunks in queue", skipped_chunks
+                                "[sync] skipped {} non-keyframe video chunks in queue", skipped_chunks
                             ).into());
                         }
 
                         // Set a PTS filter to discard stale frames from the decoder's
-                        // internal pipeline. WebCodecs decoding is async — the decoder
-                        // may still produce frames from chunks fed BEFORE the skip.
-                        // These old frames would contaminate the clock re-anchor.
+                        // internal pipeline only if we actually found a close keyframe.
                         if let Some(kf_pts) = next_kf_pts_us {
                             self.skip_frames_before_us = Some(kf_pts);
                             console::log_1(&format!(
@@ -1126,6 +1438,8 @@ impl Player {
                         // Without this, the clock keeps advancing during the flush
                         // and all subsequent frames arrive "late" → infinite skip loop.
                         self.clock_synced_to_first_frame = false;
+                        // Resync frame_timer so the next frame starts fresh
+                        self.av_sync.resync_timer(wall_now);
                         break;
                     }
                     SyncAction::Hold => {
@@ -1136,6 +1450,17 @@ impl Player {
                 break; // No frames available
             }
         }
+
+        // Render the best (latest renderable) frame found in the scan above.
+        if let Some(frame) = best_frame {
+            let _ = self.renderer.render_frame(&frame);
+            frame.close();
+            self.perf_rendered_frames += 1;
+        }
+
+        let sync_ms = now_ms() - sync_t0;
+
+        let other_t0 = now_ms();
 
         // 5. Emit sync stats every ~60 frames (~1x/sec at 60fps)
         self.sync_stats_frame_counter += 1;
@@ -1217,10 +1542,17 @@ impl Player {
         } else if self.state.status == PlaybackStatus::Buffering {
             // We have data again — resume playing
             if let Some(since) = self.buffering_since_ms {
+                let stall_ms = wall_now - since;
                 console::log_1(&format!(
                     "[state] Buffering → Playing (resumed after {:.0}ms)",
-                    wall_now - since
+                    stall_ms
                 ).into());
+                // Re-anchor the clock to prevent the buffering gap from causing
+                // all pending frames to be "late" → mass drops → SkipToKeyframe.
+                // current_time_ms was frozen during buffering, so re-sync to it.
+                self.playback_start_time = self.master_now_ms() - self.state.current_time_ms as f64;
+                self.clock_synced_to_first_frame = false;
+                self.av_sync.resync_timer(now_ms());
             }
             self.state.status = PlaybackStatus::Playing;
             self.buffering_since_ms = None;
@@ -1265,6 +1597,72 @@ impl Player {
             });
         }
 
+        // === Performance telemetry (end of tick) ===
+        let other_ms = now_ms() - other_t0;
+        let tick_total_ms = now_ms() - tick_t0;
+
+        self.perf_demux_ms += demux_ms;
+        self.perf_decode_ms += decode_ms;
+        self.perf_sync_ms += sync_ms;
+        self.perf_other_ms += other_ms;
+        self.perf_total_ms += tick_total_ms;
+        if tick_total_ms > self.perf_max_tick_ms {
+            self.perf_max_tick_ms = tick_total_ms;
+        }
+        self.perf_tick_count += 1;
+
+        // Alert on any tick exceeding 8ms (half of 16ms rAF budget)
+        if tick_total_ms > 8.0 {
+            self.perf_slow_ticks += 1;
+            console::log_1(&format!(
+                "[PERF] SLOW TICK #{}: {:.1}ms (demux={:.1}, decode={:.1}, sync={:.1}, other={:.1}) cq={} vq={}",
+                _dtick, tick_total_ms, demux_ms, decode_ms, sync_ms, other_ms,
+                self.chunk_queue.len(), self.video_decoder.queue_len()
+            ).into());
+        }
+
+        // Periodic summary every 120 ticks (~2s at 60fps)
+        if self.perf_tick_count >= 120 {
+            let n = self.perf_tick_count as f64;
+            let perf_clock = self.clock_ms();
+            let perf_master = self.master_now_ms();
+            let perf_peek = self.video_decoder.peek_timestamp_us()
+                .map(|us| us / 1000.0);
+            let perf_threshold = self.av_sync.threshold_ms();
+            console::log_1(&format!(
+                "[PERF] {}ticks: avg={:.2}ms (demux={:.2}, decode={:.2}, sync={:.2}, other={:.2}) max={:.1}ms rebuilds={} rendered={} slow={} cq={} vq={} dq={} clock={:.0}ms master={:.0} peek={} thr={:.0}ms audio={}",
+                self.perf_tick_count,
+                self.perf_total_ms / n,
+                self.perf_demux_ms / n,
+                self.perf_decode_ms / n,
+                self.perf_sync_ms / n,
+                self.perf_other_ms / n,
+                self.perf_max_tick_ms,
+                self.perf_rebuild_count,
+                self.perf_rendered_frames,
+                self.perf_slow_ticks,
+                self.chunk_queue.len(),
+                self.video_decoder.queue_len(),
+                self.video_decoder.decode_queue_size(),
+                perf_clock,
+                perf_master,
+                perf_peek.map(|p| format!("{:.0}ms", p)).unwrap_or_else(|| "none".into()),
+                perf_threshold,
+                self.audio_pipeline.is_configured()
+            ).into());
+            // Reset window
+            self.perf_demux_ms = 0.0;
+            self.perf_decode_ms = 0.0;
+            self.perf_sync_ms = 0.0;
+            self.perf_other_ms = 0.0;
+            self.perf_total_ms = 0.0;
+            self.perf_max_tick_ms = 0.0;
+            self.perf_tick_count = 0;
+            self.perf_rebuild_count = 0;
+            self.perf_rendered_frames = 0;
+            self.perf_slow_ticks = 0;
+        }
+
         true
     }
 
@@ -1298,6 +1696,8 @@ impl Player {
         self.state.current_time_ms = 0;
         self.renderer.clear();
         self.chunk_queue.clear();
+        self.pending_recovery_keyframe = None;
+            self.video_dead_since_tick = 0;
         // Close audio pipeline — stops all playback and releases resources
         self.audio_pipeline.close();
         self.video_decoder.flush_queue();
@@ -1319,6 +1719,13 @@ impl Player {
     /// **Fallback** (no SeekIndex or no Range support):
     /// Seeks within existing download buffer using proportional estimation.
     pub async fn seek(&mut self, time_ms: u64) -> Result<(), JsValue> {
+        SEEKING.with(|s| s.set(true));
+        let result = self.seek_inner(time_ms).await;
+        SEEKING.with(|s| s.set(false));
+        result
+    }
+
+    async fn seek_inner(&mut self, time_ms: u64) -> Result<(), JsValue> {
         if !self.header_parsed {
             return Err(JsValue::from_str("Cannot seek before media is loaded"));
         }
@@ -1351,6 +1758,8 @@ impl Player {
 
         // 1. Clear chunk queue + flush decoders
         self.chunk_queue.clear();
+        self.pending_recovery_keyframe = None;
+            self.video_dead_since_tick = 0;
 
         // 2. Close and reconfigure decoders — WebCodecs decoders can enter
         //    an unrecoverable error state; the safest approach is to recreate
@@ -1404,10 +1813,10 @@ impl Player {
         self.last_demux_data_len = 0; // Force re-demux
         self.try_demux_more();
 
-        // 5. Resynchronize clock
-        self.playback_start_time = now_ms() - actual_ms;
+        // 5. Resynchronize clock (use audio clock when available for drift-free sync)
+        self.playback_start_time = self.master_now_ms() - actual_ms;
         self.av_sync.reset();
-        self.av_sync.set_start_offset(0.0);
+        self.av_sync.resync_timer(now_ms());
         self.clock_synced_to_first_frame = false;
         self.skip_frames_before_us = None;
         if self.audio_pipeline.is_configured() {
@@ -1530,6 +1939,8 @@ impl Player {
         self.audio_pipeline.close();
         self.renderer.clear();
         self.chunk_queue.clear();
+        self.pending_recovery_keyframe = None;
+            self.video_dead_since_tick = 0;
         self.download = SharedDownload::new();
         self.event_callback = None;
         self.state = PlayerState::default();
@@ -1538,7 +1949,10 @@ impl Player {
         self.header_parsed = false;
         self.demuxer_format = None;
         self.mp4_cursors = None;
+        self.mp4_demuxer = None;
+        self.mp4_cache_data_len = 0;
         self.mkv_frames_read = 0;
+        self.mkv_last_demuxed_ts_us = 0;
         self.last_demux_data_len = 0;
         self.current_url = None;
         self.server_supports_range = false;
@@ -1790,6 +2204,15 @@ impl Player {
             }
             buf
         }
+    }
+
+    /// Build a raw data buffer for MKV/WebM demuxing.
+    /// Unlike build_demux_buffer() which patches MP4 mdat/moov headers,
+    /// MKV data must be passed through unmodified — any byte patching
+    /// can corrupt EBML elements and cause the demuxer to jump to wrong
+    /// positions, producing frame skips.
+    fn build_mkv_buffer(&self) -> Vec<u8> {
+        self.download.borrow().data.clone()
     }
 
     /// Emit a download progress event from current SharedDownload state (throttled to ~2Hz).
@@ -2048,6 +2471,12 @@ impl Player {
                                 cluster_pos, cluster_pos
                             ).into());
                         }
+                        // Save timestamp scale for incremental cluster scanning
+                        self.mkv_timestamp_scale_ns = demuxer.timestamp_scale_ns();
+                        // Initialize cluster scan offset (we've scanned the initial data)
+                        self.mkv_cluster_scan_offset = data.len();
+                        // Seed player-level seek_index from initial parse
+                        self.seek_index = demuxer.build_seek_index();
                         info
                     }
                     Err(_) => return Ok(false),
@@ -2079,19 +2508,40 @@ impl Player {
             None => return,
         };
 
-        const MAX_DRAIN: usize = 2048;
+        const MAX_DRAIN: usize = 256;
         let mut count = 0;
 
         match format {
             ContainerFormat::Mp4 => {
-                // Only re-demux if we have significant new data since last session.
-                // Re-parsing the header is expensive (clones full buffer), so require
-                // at least 64KB of new data before bothering.
+                // Strategy: cache the MP4 demuxer and reuse it when no new data arrived.
+                // Only re-create (expensive: clone buffer + re-parse) when new data is available.
+
+                // 1. Try reading from cached demuxer first
+                if let Some(ref mut demuxer) = self.mp4_demuxer {
+                    while count < MAX_DRAIN {
+                        match demuxer.next_chunk() {
+                            Ok(Some(chunk)) => {
+                                self.chunk_queue.push_back(chunk);
+                                count += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if count > 0 {
+                        self.mp4_cursors = Some(demuxer.sample_positions());
+                        self.last_demux_data_len = data_len;
+                        return;
+                    }
+                    // Cache exhausted — check for new data below
+                }
+
+                // 2. Only re-create if we have significant new data
                 let min_new_bytes = if self.chunk_queue.is_empty() { 0 } else { 65536 };
-                if data_len <= self.last_demux_data_len + min_new_bytes {
+                if data_len <= self.mp4_cache_data_len + min_new_bytes {
                     return;
                 }
                 let data = self.build_demux_buffer();
+                let download_len = self.download.borrow().data.len();
                 let mut demuxer = Mp4Demuxer::new();
                 if let Err(e) = demuxer.parse_header(&data) {
                     // Only log once per data_len to avoid console spam
@@ -2108,6 +2558,14 @@ impl Player {
                     }
                     self.last_demux_data_len = data_len;
                     return;
+                }
+                // CRITICAL: Limit reads to actual download data to prevent
+                // read_sample() from reading moov bytes as video/audio data.
+                // Without this, samples whose stco offsets fall in the
+                // [download_len, download_len+moov_len) range would successfully
+                // read moov bytes, producing corrupt frames that crash the decoder.
+                if self.moov_data.is_some() {
+                    demuxer.set_data_limit(download_len as u64);
                 }
                 // Resume from last position (O(1) — just sets cursor indices)
                 if let Some(ref cursors) = self.mp4_cursors {
@@ -2137,18 +2595,22 @@ impl Player {
                     ).into());
                 }
                 self.mp4_cursors = Some(demuxer.sample_positions());
+                self.mp4_cache_data_len = data_len;
+                self.mp4_demuxer = Some(demuxer);
             }
             ContainerFormat::Mkv | ContainerFormat::WebM => {
                 // Strategy: reuse cached demuxer (O(1) per chunk).
-                // On exhaustion + new data: recreate with incremental buffer only.
-                // The expensive O(n) skip_frames fallback is ONLY used on the very first
-                // call (when mkv_frames_read == 0, so skip is a no-op).
+                // On exhaustion + new data: rebuild from ALL data + skip_frames
+                // to resume at the exact position. This guarantees zero frame loss
+                // at buffer boundaries (no Cluster-boundary heuristic needed).
 
                 // 1. Try reading from cached demuxer first (O(1) per chunk)
                 if let Some(ref mut demuxer) = self.mkv_demuxer {
                     while count < MAX_DRAIN {
                         match demuxer.next_chunk() {
                             Ok(Some(chunk)) => {
+                                // Track last timestamp for optimized rebuild skip
+                                self.mkv_last_demuxed_ts_us = chunk.timestamp_us;
                                 self.chunk_queue.push_back(chunk);
                                 count += 1;
                             }
@@ -2160,6 +2622,11 @@ impl Player {
                         self.last_demux_data_len = data_len;
                         return;
                     }
+                    // Cache exhausted — log for debugging
+                    console::log_1(&format!(
+                        "[demux] MKV cache exhausted: frames_read={}, dl={}KB",
+                        self.mkv_frames_read, data_len / 1024
+                    ).into());
                 }
 
                 // 2. Only recreate if new data arrived
@@ -2167,100 +2634,199 @@ impl Player {
                     return;
                 }
 
-                // 3. Try incremental buffer: header + new data from Cluster boundary
-                //    This avoids the expensive O(n) skip_frames.
-                if let Some(ref header) = self.mkv_header_bytes {
-                    if self.mkv_cache_created_at > 0 {
-                        // Build synthetic buffer while holding the borrow, then release
-                        let synthetic = {
-                            let dl = self.download.borrow();
-                            let new_start = self.mkv_cache_created_at;
-                            if new_start < dl.data.len() {
-                                let new_data = &dl.data[new_start..];
-                                if let Some(cluster_pos) = find_cluster_offset(new_data) {
-                                    let cluster_data = &new_data[cluster_pos..];
-                                    let mut buf = Vec::with_capacity(
-                                        header.len() + cluster_data.len(),
-                                    );
-                                    buf.extend_from_slice(header);
-                                    buf.extend_from_slice(cluster_data);
-                                    Some(buf)
-                                } else {
-                                    None // No Cluster boundary yet — wait for more data
-                                }
-                            } else {
-                                None
-                            }
-                        }; // dl dropped here
-
-                        if let Some(synthetic) = synthetic {
-                            let synth_len = synthetic.len();
-                            let t0 = now_ms();
-                            let mut demuxer = MkvDemuxer::new();
-                            if demuxer.parse_header_streaming(&synthetic).is_ok() {
-                                let t_parse = now_ms() - t0;
-                                while count < MAX_DRAIN {
-                                    match demuxer.next_chunk() {
-                                        Ok(Some(chunk)) => {
-                                            self.chunk_queue.push_back(chunk);
-                                            count += 1;
-                                        }
-                                        Ok(None) => break,
-                                        Err(_) => break,
-                                    }
-                                }
-                                let t_total = now_ms() - t0;
-                                if count > 0 {
-                                    self.mkv_frames_read += demuxer.frames_read();
-                                    self.mkv_cache_created_at = data_len;
-                                    self.mkv_demuxer = Some(demuxer);
-                                    console::log_1(&format!(
-                                        "[demux] incremental OK: {}ch in {:.1}ms (parse={:.1}ms, synth={}B)",
-                                        count, t_total, t_parse, synth_len
-                                    ).into());
-                                }
-                                // else: Cluster found but no frames — wait for more data
-                            } else {
-                                console::log_1(&format!(
-                                    "[demux] incremental parse_header failed, synth_len={}",
-                                    synth_len
-                                ).into());
-                            }
-                        }
-                    }
-                }
-
-                // 4. First-time creation only (mkv_cache_created_at == 0 means never
-                //    created before). This is cheap because mkv_frames_read == 0 at this
-                //    point, so skip_frames is a no-op.
-                if self.mkv_cache_created_at == 0 {
+                // 3. Rebuild demuxer with SYNTHETIC buffer optimization.
+                //
+                //    Instead of cloning the ENTIRE download buffer (200MB+) and parsing
+                //    all of it, we build: [MKV header] + [data from last Cluster onward].
+                //    This reduces buffer size from ~200MB to ~header(10KB) + recent data(1-5MB),
+                //    and skip_frames from O(N_total_frames) to O(~60 frames per Cluster).
+                //
+                //    Fallback: if header_bytes or seek_index unavailable, use full buffer.
+                {
                     let t0 = now_ms();
-                    let data = self.build_demux_buffer();
-                    let mut demuxer = MkvDemuxer::new();
-                    if demuxer.parse_header_streaming(&data).is_err() {
-                        self.last_demux_data_len = data_len;
-                        return;
-                    }
-                    let t_parse = now_ms() - t0;
-                    // mkv_frames_read is always 0 here, so skip is a no-op
-                    while count < MAX_DRAIN {
-                        match demuxer.next_chunk() {
-                            Ok(Some(chunk)) => {
-                                self.chunk_queue.push_back(chunk);
-                                count += 1;
+                    let old_frames_read = self.mkv_frames_read;
+                    let resume_ts = self.mkv_last_demuxed_ts_us;
+
+                    // Step A: Update player-level seek_index with newly downloaded clusters
+                    {
+                        let dl = self.download.borrow();
+                        let scan_from = self.mkv_cluster_scan_offset;
+                        if dl.data.len() > scan_from {
+                            let new_entries = MkvDemuxer::scan_clusters_for_seek_index(
+                                &dl.data, self.mkv_timestamp_scale_ns, scan_from,
+                            );
+                            if !new_entries.is_empty() {
+                                self.seek_index.merge(new_entries);
                             }
-                            Ok(None) => break,
-                            Err(_) => break,
+                            self.mkv_cluster_scan_offset = dl.data.len();
                         }
                     }
-                    let t_total = now_ms() - t0;
-                    console::log_1(&format!(
-                        "[demux] first-time MKV: {}ch in {:.1}ms (parse={:.1}ms, buf={}B)",
-                        count, t_total, t_parse, data.len()
-                    ).into());
-                    self.mkv_frames_read = demuxer.frames_read();
-                    self.mkv_cache_created_at = data_len;
-                    self.mkv_demuxer = Some(demuxer);
+
+                    // Step B: Try synthetic buffer (header + data from resume Cluster)
+                    let (mut demuxer, buf_kb, synthetic_used) = if let (
+                        Some(ref header_bytes),
+                        Some(entry),
+                    ) = (
+                        &self.mkv_header_bytes,
+                        if resume_ts > 0 { self.seek_index.lookup_keyframe(resume_ts).cloned() } else { None },
+                    ) {
+                        let cluster_offset = entry.byte_offset as usize;
+                        let dl = self.download.borrow();
+                        if cluster_offset < dl.data.len() {
+                            let cluster_data = &dl.data[cluster_offset..];
+                            let synthetic_size = header_bytes.len() + cluster_data.len();
+                            let mut synthetic = Vec::with_capacity(synthetic_size);
+                            synthetic.extend_from_slice(header_bytes);
+                            synthetic.extend_from_slice(cluster_data);
+                            drop(dl);
+
+                            let buf_kb = synthetic.len() / 1024;
+                            let mut d = MkvDemuxer::new();
+                            match d.parse_header_streaming_owned(synthetic) {
+                                Ok(_) => {
+                                    // Skip forward by timestamp to resume point.
+                                    // We must ensure the decoder receives a keyframe FIRST,
+                                    // so we track the last video keyframe seen during skip.
+                                    // All chunks from that keyframe onward are queued.
+                                    let mut skip_count = 0;
+                                    let mut held_since_kf: Vec<EncodedChunk> = Vec::new();
+                                    let mut reached_resume = false;
+                                    loop {
+                                        match d.next_chunk() {
+                                            Ok(Some(chunk)) => {
+                                                skip_count += 1;
+                                                if chunk.timestamp_us >= resume_ts {
+                                                    // We've reached resume point — keep this chunk
+                                                    held_since_kf.push(chunk);
+                                                    reached_resume = true;
+                                                    break;
+                                                }
+                                                if chunk.is_video && chunk.is_keyframe {
+                                                    // New video keyframe — reset held buffer.
+                                                    // Everything before this is safe to discard.
+                                                    held_since_kf.clear();
+                                                }
+                                                // Keep all chunks from the last keyframe onward
+                                                // so the decoder has the reference frames it needs.
+                                                held_since_kf.push(chunk);
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                    // Push held chunks to chunk_queue so decoder gets
+                                    // the keyframe + all following frames in order
+                                    let held_count = held_since_kf.len();
+                                    for c in held_since_kf {
+                                        self.chunk_queue.push_back(c);
+                                        count += 1;
+                                    }
+                                    let t_skip = now_ms() - t0;
+                                    console::log_1(&format!(
+                                        "[demux] MKV synthetic rebuild: skipped {} frames, kept {} (from last kf) to {}ms in {:.1}ms (buf={}KB vs dl={}KB, cluster@{}) reached={}",
+                                        skip_count, held_count, resume_ts / 1000, t_skip, buf_kb, data_len / 1024, cluster_offset, reached_resume
+                                    ).into());
+                                    (d, buf_kb, true)
+                                }
+                                Err(e) => {
+                                    console::log_1(&format!(
+                                        "[demux] MKV synthetic parse failed, fallback to full: {:?}", e
+                                    ).into());
+                                    // Fall through to full-buffer path
+                                    let data = self.build_mkv_buffer();
+                                    let bk = data.len() / 1024;
+                                    let mut d2 = MkvDemuxer::new();
+                                    if d2.parse_header_streaming_owned(data).is_err() {
+                                        self.last_demux_data_len = data_len;
+                                        return;
+                                    }
+                                    if old_frames_read > 0 {
+                                        let _ = d2.skip_frames(old_frames_read);
+                                    }
+                                    (d2, bk, false)
+                                }
+                            }
+                        } else {
+                            drop(dl);
+                            // cluster_offset beyond download — fall through
+                            let data = self.build_mkv_buffer();
+                            let bk = data.len() / 1024;
+                            let mut d = MkvDemuxer::new();
+                            if d.parse_header_streaming_owned(data).is_err() {
+                                self.last_demux_data_len = data_len;
+                                return;
+                            }
+                            if old_frames_read > 0 {
+                                let _ = d.skip_frames(old_frames_read);
+                            }
+                            (d, bk, false)
+                        }
+                    } else {
+                        // No header_bytes or no resume timestamp — full buffer fallback
+                        let data = self.build_mkv_buffer();
+                        let bk = data.len() / 1024;
+                        let mut d = MkvDemuxer::new();
+                        if d.parse_header_streaming_owned(data).is_err() {
+                            if self.mkv_cache_created_at == 0 {
+                                self.last_demux_data_len = data_len;
+                                return;
+                            }
+                            // Keep old demuxer
+                            self.last_demux_data_len = data_len;
+                            return;
+                        }
+                        if old_frames_read > 0 {
+                            let _ = d.skip_frames(old_frames_read);
+                        }
+                        (d, bk, false)
+                    };
+                    let t_parse = now_ms() - t0;
+
+                    // Step C: Drain new chunks
+                    {
+                        let mut first_ts: Option<(bool, i64)> = None;
+                        while count < MAX_DRAIN {
+                            match demuxer.next_chunk() {
+                                Ok(Some(chunk)) => {
+                                    if first_ts.is_none() || (count < 5) {
+                                        console::log_1(&format!(
+                                            "[demux] MKV rebuild chunk#{}: {} ts={}us ({}ms) kf={}",
+                                            count,
+                                            if chunk.is_video { "V" } else if chunk.is_audio { "A" } else { "?" },
+                                            chunk.timestamp_us,
+                                            chunk.timestamp_us / 1000,
+                                            chunk.is_keyframe
+                                        ).into());
+                                    }
+                                    if first_ts.is_none() {
+                                        first_ts = Some((chunk.is_video, chunk.timestamp_us));
+                                    }
+                                    self.mkv_last_demuxed_ts_us = chunk.timestamp_us;
+                                    self.chunk_queue.push_back(chunk);
+                                    count += 1;
+                                }
+                                Ok(None) => break,
+                                Err(_) => break,
+                            }
+                        }
+                        let t_total = now_ms() - t0;
+                        if count > 0 || self.mkv_cache_created_at == 0 {
+                            let (first_type, first_us) = first_ts.unwrap_or((false, -1));
+                            console::log_1(&format!(
+                                "[demux] MKV rebuild: {}ch in {:.1}ms (parse={:.1}ms, buf={}KB, {}) first_chunk={}@{}ms",
+                                count, t_total, t_parse, buf_kb,
+                                if synthetic_used { "synthetic" } else { "full" },
+                                if first_type { "V" } else { "A" },
+                                first_us / 1000
+                            ).into());
+                        }
+                        self.mkv_frames_read = demuxer.frames_read();
+                        self.mkv_cache_created_at = data_len;
+                        self.mkv_demuxer = Some(demuxer);
+                        // T5 telemetry
+                        self.perf_rebuild_count += 1;
+                        self.perf_last_synthetic = synthetic_used;
+                        self.perf_last_buf_kb = buf_kb;
+                    }
                 }
             }
             _ => {}
@@ -2276,14 +2842,18 @@ impl Player {
             JsValue::from_str("No demuxer format set")
         })?;
 
-        let data = self.build_demux_buffer();
-
         match format {
             ContainerFormat::Mp4 => {
+                let data = self.build_demux_buffer();
+                let download_len = self.download.borrow().data.len();
                 let mut demuxer = Mp4Demuxer::new();
                 demuxer.parse_header(&data).map_err(|e| {
                     JsValue::from_str(&format!("Seek: MP4 parse error: {}", e))
                 })?;
+                // Limit reads to actual data (see try_demux_more for explanation)
+                if self.moov_data.is_some() {
+                    demuxer.set_data_limit(download_len as u64);
+                }
 
                 demuxer.seek_to_keyframe(timestamp_us).map_err(|e| {
                     JsValue::from_str(&format!("Seek error: {}", e))
@@ -2293,8 +2863,9 @@ impl Player {
                 self.mp4_cursors = Some(demuxer.sample_positions());
             }
             ContainerFormat::Mkv | ContainerFormat::WebM => {
+                let data = self.build_mkv_buffer();
                 let mut demuxer = MkvDemuxer::new();
-                demuxer.parse_header_streaming(&data).map_err(|e| {
+                demuxer.parse_header_streaming_owned(data).map_err(|e| {
                     JsValue::from_str(&format!("Seek: MKV parse error: {}", e))
                 })?;
 
@@ -2501,8 +3072,10 @@ impl Player {
 
                 // Reset MKV demuxer state
                 self.mkv_frames_read = 0;
+                self.mkv_last_demuxed_ts_us = 0;
                 self.mkv_demuxer = None;
                 self.mkv_cache_created_at = 0;
+                self.mkv_cluster_scan_offset = 0;
                 self.last_demux_data_len = 0;
 
                 // Parse + seek
@@ -2732,8 +3305,10 @@ impl Player {
 
         // Reset MKV demuxer state
         self.mkv_frames_read = 0;
+        self.mkv_last_demuxed_ts_us = 0;
         self.mkv_demuxer = None;
         self.mkv_cache_created_at = 0;
+        self.mkv_cluster_scan_offset = 0;
         self.last_demux_data_len = 0;
 
         // Parse header + seek within synthetic buffer
@@ -2830,10 +3405,23 @@ impl Player {
     }
 
     /// Get the current master clock in milliseconds.
-    /// Uses performance.now() offset from playback_start_time.
+    /// Master clock source: AudioContext.currentTime (ms) when audio is active,
+    /// otherwise falls back to performance.now().
+    /// AudioContext.currentTime is sample-accurate and immune to rAF jitter,
+    /// which prevents the clock drift that causes frame drops.
+    fn master_now_ms(&self) -> f64 {
+        if self.audio_pipeline.is_configured() {
+            self.audio_pipeline.current_time_ms()
+        } else {
+            now_ms()
+        }
+    }
+
+    /// Current playback position in milliseconds.
+    /// Uses master_now_ms() offset from playback_start_time.
     /// After seek to time T, playback_start_time is set so clock starts at T.
     fn clock_ms(&self) -> f64 {
-        now_ms() - self.playback_start_time
+        self.master_now_ms() - self.playback_start_time
     }
 
     /// Spawn a background task to continue downloading remaining data.
@@ -3045,10 +3633,17 @@ impl Player {
         self.header_parsed = false;
         self.demuxer_format = None;
         self.chunk_queue.clear();
+        self.pending_recovery_keyframe = None;
+            self.video_dead_since_tick = 0;
         self.mp4_cursors = None;
+        self.mp4_demuxer = None;
+        self.mp4_cache_data_len = 0;
         self.mkv_frames_read = 0;
+        self.mkv_last_demuxed_ts_us = 0;
         self.mkv_demuxer = None;
         self.mkv_cache_created_at = 0;
+        self.mkv_cluster_scan_offset = 0;
+        self.mkv_timestamp_scale_ns = 1_000_000;
         self.mkv_header_bytes = None;
         self.last_demux_data_len = 0;
         self.moov_data = None;

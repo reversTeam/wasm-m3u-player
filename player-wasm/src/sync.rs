@@ -1,47 +1,83 @@
-/// A/V synchronization using audio clock as master.
+/// A/V synchronization based on FFmpeg/ffplay's algorithm.
 ///
-/// Strategy:
-/// - Audio clock (AudioContext.currentTime) is the master reference.
-/// - For each video frame, compare its PTS with the audio clock.
-/// - If the frame is too early (> threshold ahead), hold it for the next rAF.
-/// - If the frame is too late (> threshold behind), drop it.
-/// - Otherwise, render it.
-/// - Threshold adapts to the detected FPS (60% of one frame interval).
-/// - After N consecutive drops, emit SkipToKeyframe to avoid endless frame-by-frame dropping.
+/// Key concepts from ffplay adapted to requestAnimationFrame:
+///
+/// 1. **frame_timer**: wall-clock accumulator tracking when the current frame was
+///    "logically" displayed. Advances by `delay` (not `now()`), so timing errors
+///    don't accumulate across frames.
+///
+/// 2. **compute_target_delay**: takes the nominal frame duration (PTS difference)
+///    and adjusts it based on video↔audio drift:
+///    - Video behind audio → shorten delay (catch up)
+///    - Video ahead of audio → lengthen delay (slow down)
+///    - Within threshold → no correction
+///
+/// 3. **Dynamic sync threshold**: `clamp(frame_duration, 40ms, 100ms)` — adapts
+///    to the actual frame rate, not a fixed constant.
+///
+/// 4. **Frame dropping**: handled by the caller's catch-up loop, not by decide().
+///    In ffplay, drops happen when the queue has more frames AND the next is also due.
+///    Our caller loop naturally does this: it keeps the LATEST renderable frame and
+///    closes intermediates.
 
-/// Default sync threshold for unknown FPS.
-const DEFAULT_SYNC_THRESHOLD_MS: f64 = 40.0;
+/// FFplay constants (in milliseconds)
+const AV_SYNC_THRESHOLD_MIN_MS: f64 = 40.0;
+const AV_SYNC_THRESHOLD_MAX_MS: f64 = 100.0;
+const AV_SYNC_FRAMEDUP_THRESHOLD_MS: f64 = 100.0;
+const AV_NOSYNC_THRESHOLD_MS: f64 = 10_000.0;
 
-/// Number of consecutive drops before triggering a keyframe skip.
-const MAX_CONSECUTIVE_DROPS: u32 = 5;
+/// If decide() returns Render this many times in a row without a Hold in between,
+/// the video is massively behind. Emit SkipToKeyframe to break the cascade.
+/// This replaces ffplay's "framedrop" heuristic adapted for our caller loop.
+const MAX_RENDERS_WITHOUT_HOLD: u32 = 12;
 
 /// Action to take for a video frame based on A/V sync.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SyncAction {
-    /// Frame is within tolerance — render it.
+    /// Frame is on time — render it now.
     Render,
-    /// Frame is too early — hold for next rAF.
+    /// Frame is too early — hold for next rAF tick.
     Hold,
-    /// Frame is too late — drop it.
+    /// Frame is too late — drop it (caller should immediately check next frame).
     Drop,
-    /// Too many consecutive drops — skip to next keyframe instead of
-    /// dropping frame-by-frame (avoids long catch-up sequences).
+    /// Massive backlog detected — skip to next keyframe.
     SkipToKeyframe,
 }
 
-/// A/V synchronization engine.
+/// A/V synchronization engine modeled after ffplay's algorithm.
+///
+/// The caller drives a tight loop per rAF tick:
+/// ```ignore
+/// let mut best_frame = None;
+/// loop {
+///     let action = sync.decide(peek_pts, clock, now);
+///     match action {
+///         Render => { best_frame = Some(take_frame()); continue; }
+///         Hold | SkipToKeyframe => { break; }
+///         Drop => { unreachable in current impl }
+///     }
+/// }
+/// if let Some(f) = best_frame { render(f); }
+/// ```
 pub struct AVSync {
-    /// Start time offset (ms) — set when playback begins.
-    start_offset_ms: f64,
-    /// Whether we have an audio clock available.
-    has_audio: bool,
-    /// Adaptive sync threshold in ms (based on FPS).
-    threshold_ms: f64,
-    /// Detected FPS (0 = unknown).
+    /// Wall-clock time (ms) when the last frame was logically displayed.
+    frame_timer_ms: Option<f64>,
+    /// PTS (ms) of the last displayed/processed frame.
+    last_pts_ms: Option<f64>,
+    /// Duration (ms) of the last frame.
+    last_duration_ms: f64,
+    /// Default frame duration when PTS diff is invalid. Set from FPS.
+    default_duration_ms: f64,
+    /// Maximum plausible frame duration (ms).
+    max_frame_duration_ms: f64,
+
+    pub has_audio: bool,
     fps: f64,
-    /// Consecutive drop count — reset on Render or Hold.
-    consecutive_drops: u32,
-    /// Stats
+
+    /// Consecutive Render calls without a Hold — detects massive backlog.
+    renders_without_hold: u32,
+
+    // Stats
     frames_rendered: u64,
     frames_dropped: u64,
     frames_held: u64,
@@ -51,11 +87,14 @@ pub struct AVSync {
 impl AVSync {
     pub fn new() -> Self {
         Self {
-            start_offset_ms: 0.0,
+            frame_timer_ms: None,
+            last_pts_ms: None,
+            last_duration_ms: 40.0,
+            default_duration_ms: 40.0,
+            max_frame_duration_ms: 5_000.0,
             has_audio: false,
-            threshold_ms: DEFAULT_SYNC_THRESHOLD_MS,
             fps: 0.0,
-            consecutive_drops: 0,
+            renders_without_hold: 0,
             frames_rendered: 0,
             frames_dropped: 0,
             frames_held: 0,
@@ -63,69 +102,129 @@ impl AVSync {
         }
     }
 
-    /// Set whether audio clock is available.
     pub fn set_has_audio(&mut self, has_audio: bool) {
         self.has_audio = has_audio;
     }
 
-    /// Set the playback start offset.
-    pub fn set_start_offset(&mut self, offset_ms: f64) {
-        self.start_offset_ms = offset_ms;
-    }
+    /// Kept for API compatibility (no-op in ffplay-style sync).
+    pub fn set_start_offset(&mut self, _offset_ms: f64) {}
 
-    /// Set the detected FPS and adapt the sync threshold.
-    /// Threshold = 60% of one frame interval (e.g. 24fps → 25ms, 30fps → 20ms, 60fps → 10ms).
+    /// Set detected FPS. Updates default frame duration.
     pub fn set_fps(&mut self, fps: f64) {
         self.fps = fps;
         if fps > 0.0 {
-            self.threshold_ms = (1000.0 / fps) * 0.6;
-            // Clamp to reasonable range
-            if self.threshold_ms < 8.0 {
-                self.threshold_ms = 8.0;
-            }
-            if self.threshold_ms > 60.0 {
-                self.threshold_ms = 60.0;
-            }
+            self.default_duration_ms = 1000.0 / fps;
         } else {
-            self.threshold_ms = DEFAULT_SYNC_THRESHOLD_MS;
+            self.default_duration_ms = 40.0;
         }
     }
 
-    /// Get the current threshold in ms (for debugging).
+    /// Get current dynamic sync threshold for debugging.
     pub fn threshold_ms(&self) -> f64 {
-        self.threshold_ms
+        self.last_duration_ms.clamp(AV_SYNC_THRESHOLD_MIN_MS, AV_SYNC_THRESHOLD_MAX_MS)
     }
 
-    /// Determine what to do with a video frame given the current clock.
+    /// Core sync decision — call for each frame in the decoded queue.
     ///
-    /// - `frame_pts_ms`: presentation timestamp of the frame in ms
-    /// - `clock_ms`: current master clock time in ms (audio or performance)
-    pub fn should_render_frame(&mut self, frame_pts_ms: f64, clock_ms: f64) -> SyncAction {
-        let adjusted_clock = clock_ms - self.start_offset_ms;
-        let diff = frame_pts_ms - adjusted_clock;
-
-        if diff > self.threshold_ms {
-            // Frame is too early — hold
-            self.frames_held += 1;
-            self.consecutive_drops = 0;
-            SyncAction::Hold
-        } else if diff < -self.threshold_ms {
-            // Frame is too late — drop (or skip if too many consecutive drops)
-            self.consecutive_drops += 1;
-            self.frames_dropped += 1;
-
-            if self.consecutive_drops >= MAX_CONSECUTIVE_DROPS {
-                self.frames_skipped += 1;
-                self.consecutive_drops = 0;
-                SyncAction::SkipToKeyframe
-            } else {
-                SyncAction::Drop
+    /// - `frame_pts_ms`: PTS of the candidate frame (ms)
+    /// - `clock_ms`: master playback clock (audio-driven, ms)
+    /// - `now_ms`: wall-clock time (performance.now(), ms)
+    ///
+    /// Returns Render, Hold, or SkipToKeyframe (never Drop in current design).
+    pub fn decide(&mut self, frame_pts_ms: f64, clock_ms: f64, now_ms: f64) -> SyncAction {
+        // First frame: render immediately, initialize timer
+        let frame_timer = match self.frame_timer_ms {
+            Some(ft) => ft,
+            None => {
+                self.frame_timer_ms = Some(now_ms);
+                self.last_pts_ms = Some(frame_pts_ms);
+                self.last_duration_ms = self.default_duration_ms;
+                self.frames_rendered += 1;
+                self.renders_without_hold = 1;
+                return SyncAction::Render;
             }
+        };
+
+        // Step 1: Frame duration from PTS difference
+        let duration = self.vp_duration(frame_pts_ms);
+
+        // Step 2: Adjust delay for A/V drift (ffplay's compute_target_delay)
+        let delay = self.compute_target_delay(duration, clock_ms);
+
+        // Step 3: Is it time?
+        if now_ms < frame_timer + delay {
+            self.frames_held += 1;
+            self.renders_without_hold = 0;
+            return SyncAction::Hold;
+        }
+
+        // Step 4: Frame is due. Advance frame_timer.
+        let mut ft = frame_timer + delay;
+
+        // Step 5: Snap frame_timer if too far behind wall clock.
+        // This prevents a catch-up storm after stalls, seeks, or tab-away.
+        // Unlike ffplay (delay > 0 guard), we ALWAYS snap — delay=0 during
+        // catch-up is when snapping matters most.
+        if (now_ms - ft) > AV_SYNC_THRESHOLD_MAX_MS {
+            ft = now_ms;
+        }
+        self.frame_timer_ms = Some(ft);
+
+        // Step 6: Update state
+        self.last_duration_ms = duration;
+        self.last_pts_ms = Some(frame_pts_ms);
+        self.frames_rendered += 1;
+        self.renders_without_hold += 1;
+
+        // Step 7: Detect massive backlog.
+        // If we've had many Renders without a single Hold, the video queue has
+        // a huge backlog. Frame-by-frame catch-up via the caller's best_frame
+        // pattern works but can burn through hundreds of frames. After N,
+        // signal SkipToKeyframe to jump ahead efficiently.
+        if self.renders_without_hold >= MAX_RENDERS_WITHOUT_HOLD {
+            self.frames_skipped += 1;
+            self.renders_without_hold = 0;
+            return SyncAction::SkipToKeyframe;
+        }
+
+        SyncAction::Render
+    }
+
+    /// Frame duration from PTS difference (ffplay's vp_duration).
+    fn vp_duration(&self, frame_pts_ms: f64) -> f64 {
+        if let Some(last) = self.last_pts_ms {
+            let dur = frame_pts_ms - last;
+            if dur > 0.0 && dur <= self.max_frame_duration_ms {
+                return dur;
+            }
+        }
+        self.default_duration_ms
+    }
+
+    /// FFplay's compute_target_delay: adjust delay based on A/V drift.
+    fn compute_target_delay(&self, delay: f64, clock_ms: f64) -> f64 {
+        let video_clock = self.last_pts_ms.unwrap_or(0.0);
+        let diff = video_clock - clock_ms;
+
+        // Give up sync if drift > 10s
+        if diff.is_nan() || diff.abs() >= AV_NOSYNC_THRESHOLD_MS {
+            return delay;
+        }
+
+        let sync_threshold = delay.clamp(AV_SYNC_THRESHOLD_MIN_MS, AV_SYNC_THRESHOLD_MAX_MS);
+
+        if diff <= -sync_threshold {
+            // Video BEHIND audio: shorten delay
+            (delay + diff).max(0.0)
+        } else if diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD_MS {
+            // Video AHEAD + long frame: proportional slow-down
+            delay + diff
+        } else if diff >= sync_threshold {
+            // Video AHEAD + short frame: double delay
+            2.0 * delay
         } else {
-            // Within tolerance — render
-            self.frames_rendered += 1;
-            self.consecutive_drops = 0;
-            SyncAction::Render
+            // Within threshold — no correction
+            delay
         }
     }
 
@@ -134,14 +233,24 @@ impl AVSync {
         (self.frames_rendered, self.frames_dropped, self.frames_held, self.frames_skipped)
     }
 
-    /// Reset sync state (e.g. after seek).
+    /// Reset all sync state (after seek).
     pub fn reset(&mut self) {
-        self.start_offset_ms = 0.0;
+        self.frame_timer_ms = None;
+        self.last_pts_ms = None;
+        self.last_duration_ms = self.default_duration_ms;
+        self.renders_without_hold = 0;
         self.frames_rendered = 0;
         self.frames_dropped = 0;
         self.frames_held = 0;
         self.frames_skipped = 0;
-        self.consecutive_drops = 0;
+    }
+
+    /// Resync frame_timer to wall clock (after seek, stall recovery, or skip).
+    pub fn resync_timer(&mut self, now_ms: f64) {
+        self.frame_timer_ms = Some(now_ms);
+        self.last_pts_ms = None;
+        self.last_duration_ms = self.default_duration_ms;
+        self.renders_without_hold = 0;
     }
 }
 
@@ -149,353 +258,267 @@ impl AVSync {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_render_within_threshold() {
+    fn make_sync_24fps() -> AVSync {
         let mut sync = AVSync::new();
-        assert_eq!(sync.should_render_frame(100.0, 100.0), SyncAction::Render);
-        assert_eq!(sync.should_render_frame(100.0, 80.0), SyncAction::Render); // 20ms early
-        assert_eq!(sync.should_render_frame(100.0, 120.0), SyncAction::Render); // 20ms late
+        sync.set_fps(24.0);
+        sync
     }
 
     #[test]
-    fn test_hold_when_early() {
-        let mut sync = AVSync::new();
-        assert_eq!(sync.should_render_frame(200.0, 100.0), SyncAction::Hold); // 100ms early
-        assert_eq!(sync.should_render_frame(150.0, 100.0), SyncAction::Hold); // 50ms early
+    fn test_first_frame_renders_immediately() {
+        let mut sync = make_sync_24fps();
+        assert_eq!(sync.decide(0.0, 0.0, 0.0), SyncAction::Render);
+        assert_eq!(sync.frames_rendered, 1);
     }
 
     #[test]
-    fn test_drop_when_late() {
-        let mut sync = AVSync::new();
-        assert_eq!(sync.should_render_frame(100.0, 200.0), SyncAction::Drop); // 100ms late
+    fn test_hold_when_too_early() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+        // Frame 1 at PTS=41.67ms, but only 10ms of wall-clock passed.
+        // delay ≈ 41.67ms (no correction: diff=0-10≈-10, within threshold 40ms)
+        // frame_timer(0) + 41.67 = 41.67 > now(10) → Hold
+        let action = sync.decide(41.67, 10.0, 10.0);
+        assert_eq!(action, SyncAction::Hold);
     }
 
     #[test]
-    fn test_skip_after_consecutive_drops() {
-        let mut sync = AVSync::new();
-        // 4 drops, then the 5th triggers SkipToKeyframe
-        for _ in 0..4 {
-            assert_eq!(sync.should_render_frame(100.0, 200.0), SyncAction::Drop);
+    fn test_render_on_time() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+        // Frame 1: PTS=41.67, clock=41.67, now=42
+        // diff = 0 - 41.67 = -41.67, threshold=41.67
+        // -41.67 <= -41.67 → delay = max(0, 41.67 - 41.67) = 0
+        // frame_timer(0) + 0 = 0, now(42) >= 0 → due
+        // snap: 42-0=42 < 100 → no snap, ft=0
+        // → Render (frame_timer advances to 0, snaps on next)
+        let action = sync.decide(41.67, 41.67, 42.0);
+        assert_eq!(action, SyncAction::Render);
+    }
+
+    #[test]
+    fn test_catch_up_after_stall() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+        // 500ms stall: now=500, clock=500, PTS=500
+        // diff = 0-500=-500, delay=max(0, 41.67-500)=0
+        // ft=0+0=0, snap: 500-0=500>100 → ft=500
+        let action = sync.decide(500.0, 500.0, 500.0);
+        assert_eq!(action, SyncAction::Render);
+
+        // Next frame schedules normally from ft=500
+        let action2 = sync.decide(541.67, 541.67, 542.0);
+        assert_eq!(action2, SyncAction::Render);
+    }
+
+    #[test]
+    fn test_catchup_shortens_delay() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+        // Video 60ms behind audio
+        // diff = 0-60=-60, threshold=41.67, -60 <= -41.67 → delay=max(0, 41.67-60)=0
+        // now(42) >= ft(0)+0 → Render
+        let action = sync.decide(41.67, 60.0, 42.0);
+        assert_eq!(action, SyncAction::Render);
+    }
+
+    #[test]
+    fn test_video_ahead_slows_down() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+        // Video 80ms ahead: clock=-80
+        // diff = 0-(-80) = 80, threshold=41.67
+        // 80 >= 41.67 && delay(41.67) <= 100 → double: delay=83.33
+        // ft(0)+83.33 = 83.33 > now(42) → Hold
+        let action = sync.decide(41.67, -80.0, 42.0);
+        assert_eq!(action, SyncAction::Hold);
+    }
+
+    #[test]
+    fn test_skip_after_massive_backlog() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+
+        // Rapidly feed frames — all "due" because frame_timer snaps
+        let mut last_action = SyncAction::Render;
+        for i in 1..=20 {
+            let pts = i as f64 * 41.67;
+            last_action = sync.decide(pts, 5000.0, 5000.0);
+            if last_action == SyncAction::SkipToKeyframe {
+                assert!(i >= MAX_RENDERS_WITHOUT_HOLD as i32 - 1,
+                    "skip at frame {} (expected around {})", i, MAX_RENDERS_WITHOUT_HOLD);
+                return;
+            }
         }
-        assert_eq!(sync.should_render_frame(100.0, 200.0), SyncAction::SkipToKeyframe);
-        // After skip, counter resets — next late frame is a normal Drop
-        assert_eq!(sync.should_render_frame(100.0, 200.0), SyncAction::Drop);
+        panic!("Expected SkipToKeyframe, last action: {:?}", last_action);
     }
 
     #[test]
-    fn test_consecutive_drops_reset_on_render() {
-        let mut sync = AVSync::new();
-        // 3 drops
-        for _ in 0..3 {
-            sync.should_render_frame(100.0, 200.0);
+    fn test_renders_reset_after_hold() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+
+        // Several renders (video behind audio → delay=0 → all due immediately)
+        for i in 1..=5 {
+            let pts = i as f64 * 41.67;
+            sync.decide(pts, 5000.0, 5000.0);
         }
-        // Then a render resets the counter
-        assert_eq!(sync.should_render_frame(100.0, 100.0), SyncAction::Render);
-        // Only 1 drop after reset — not enough for skip
-        assert_eq!(sync.should_render_frame(100.0, 200.0), SyncAction::Drop);
+        assert!(sync.renders_without_hold > 0);
+
+        // A Hold: video is AHEAD of audio → doubled delay → Hold
+        // frame_timer ≈ 5000 after snap. delay doubled = 83.33ms.
+        // ft(5000) + 83.33 = 5083.33 > now(5001) → Hold
+        sync.decide(999999.0, -1000.0, 5001.0);
+        assert_eq!(sync.renders_without_hold, 0);
     }
 
     #[test]
     fn test_stats() {
-        let mut sync = AVSync::new();
-        sync.should_render_frame(100.0, 100.0); // render
-        sync.should_render_frame(200.0, 100.0); // hold
-        sync.should_render_frame(100.0, 200.0); // drop
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);         // Render
+        sync.decide(41.67, 5.0, 5.0);        // Hold (too early)
 
-        let (rendered, dropped, held, skipped) = sync.stats();
+        let (rendered, _dropped, held, _skipped) = sync.stats();
         assert_eq!(rendered, 1);
-        assert_eq!(dropped, 1);
         assert_eq!(held, 1);
-        assert_eq!(skipped, 0);
     }
 
     #[test]
-    fn test_with_start_offset() {
-        let mut sync = AVSync::new();
-        sync.set_start_offset(50.0);
-
-        // clock=100, offset=50 → adjusted=50, frame=100 → diff=50 → Hold
-        assert_eq!(sync.should_render_frame(100.0, 100.0), SyncAction::Hold);
-
-        // clock=150, offset=50 → adjusted=100, frame=100 → diff=0 → Render
-        assert_eq!(sync.should_render_frame(100.0, 150.0), SyncAction::Render);
-    }
-
-    #[test]
-    fn test_adaptive_threshold_24fps() {
-        let mut sync = AVSync::new();
-        sync.set_fps(24.0);
-        // 1000/24 * 0.6 = 25ms threshold
-        assert!((sync.threshold_ms() - 25.0).abs() < 0.1);
-        // 30ms late with 25ms threshold → Drop
-        assert_eq!(sync.should_render_frame(100.0, 130.0), SyncAction::Drop);
-        // 20ms late with 25ms threshold → Render
-        assert_eq!(sync.should_render_frame(100.0, 120.0), SyncAction::Render);
-    }
-
-    #[test]
-    fn test_adaptive_threshold_60fps() {
-        let mut sync = AVSync::new();
-        sync.set_fps(60.0);
-        // 1000/60 * 0.6 = 10ms, but clamped to min 8ms
-        assert!((sync.threshold_ms() - 10.0).abs() < 0.1);
-    }
-
-    // =============================================
-    // Additional boundary tests
-    // =============================================
-
-    #[test]
-    fn test_reset_clears_all_state() {
-        let mut sync = AVSync::new();
-        sync.set_start_offset(100.0);
-        // Generate some activity
-        sync.should_render_frame(100.0, 100.0); // render
-        sync.should_render_frame(100.0, 200.0); // drop
-        sync.should_render_frame(200.0, 100.0); // hold
-
+    fn test_reset_clears_all() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+        sync.decide(100.0, 100.0, 200.0);
         sync.reset();
 
         let (r, d, h, s) = sync.stats();
         assert_eq!((r, d, h, s), (0, 0, 0, 0));
-        // After reset, start_offset should be 0 → same PTS/clock → Render
-        assert_eq!(sync.should_render_frame(100.0, 100.0), SyncAction::Render);
+        assert!(sync.frame_timer_ms.is_none());
     }
 
     #[test]
-    fn test_double_reset() {
-        let mut sync = AVSync::new();
-        sync.should_render_frame(100.0, 100.0);
-        sync.reset();
-        sync.reset(); // Double reset should be safe
-        let (r, d, h, s) = sync.stats();
-        assert_eq!((r, d, h, s), (0, 0, 0, 0));
+    fn test_resync_timer() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+        sync.resync_timer(5000.0);
+
+        // Next frame renders immediately (first after resync)
+        let action = sync.decide(5000.0, 5000.0, 5000.0);
+        assert_eq!(action, SyncAction::Render);
     }
 
     #[test]
-    fn test_set_fps_zero() {
-        let mut sync = AVSync::new();
-        sync.set_fps(0.0);
-        assert_eq!(sync.threshold_ms(), DEFAULT_SYNC_THRESHOLD_MS);
-    }
-
-    #[test]
-    fn test_set_fps_negative() {
-        let mut sync = AVSync::new();
-        sync.set_fps(-24.0);
-        // Negative FPS → fps <= 0 → fallback to default
-        assert_eq!(sync.threshold_ms(), DEFAULT_SYNC_THRESHOLD_MS);
-    }
-
-    #[test]
-    fn test_threshold_clamp_min_8ms() {
-        let mut sync = AVSync::new();
-        // 240fps → 1000/240 * 0.6 = 2.5ms → should clamp to 8ms
-        sync.set_fps(240.0);
-        assert_eq!(sync.threshold_ms(), 8.0);
-    }
-
-    #[test]
-    fn test_threshold_clamp_max_60ms() {
-        let mut sync = AVSync::new();
-        // 5fps → 1000/5 * 0.6 = 120ms → should clamp to 60ms
-        sync.set_fps(5.0);
-        assert_eq!(sync.threshold_ms(), 60.0);
-    }
-
-    #[test]
-    fn test_threshold_30fps() {
+    fn test_set_fps() {
         let mut sync = AVSync::new();
         sync.set_fps(30.0);
-        // 1000/30 * 0.6 = 20ms
-        assert!((sync.threshold_ms() - 20.0).abs() < 0.1);
+        assert!((sync.default_duration_ms - 33.33).abs() < 0.1);
+        sync.set_fps(60.0);
+        assert!((sync.default_duration_ms - 16.67).abs() < 0.1);
+        sync.set_fps(0.0);
+        assert_eq!(sync.default_duration_ms, 40.0);
     }
 
     #[test]
-    fn test_threshold_120fps() {
-        let mut sync = AVSync::new();
-        sync.set_fps(120.0);
-        // 1000/120 * 0.6 = 5ms → clamp to 8ms
-        assert_eq!(sync.threshold_ms(), 8.0);
+    fn test_vp_duration_uses_pts_diff() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+        sync.decide(50.0, 50.0, 50.0);
+        assert!((sync.last_duration_ms - 50.0).abs() < 0.1);
     }
 
     #[test]
-    fn test_exact_threshold_boundary_render() {
-        let mut sync = AVSync::new();
-        // Default threshold = 40ms
-        // diff = exactly 40ms → should Render (not Hold/Drop)
-        assert_eq!(sync.should_render_frame(140.0, 100.0), SyncAction::Render);
-        assert_eq!(sync.should_render_frame(60.0, 100.0), SyncAction::Render);
-    }
-
-    #[test]
-    fn test_just_beyond_threshold_hold() {
-        let mut sync = AVSync::new();
-        // diff = 40.001 → just beyond threshold → Hold
-        assert_eq!(
-            sync.should_render_frame(140.001, 100.0),
-            SyncAction::Hold
-        );
-    }
-
-    #[test]
-    fn test_just_beyond_threshold_drop() {
-        let mut sync = AVSync::new();
-        // diff = -40.001 → just beyond threshold → Drop
-        assert_eq!(
-            sync.should_render_frame(59.999, 100.0),
-            SyncAction::Drop
-        );
-    }
-
-    #[test]
-    fn test_consecutive_holds_dont_trigger_skip() {
-        let mut sync = AVSync::new();
-        // 100 consecutive holds — should never trigger SkipToKeyframe
-        for _ in 0..100 {
-            assert_eq!(sync.should_render_frame(1000.0, 100.0), SyncAction::Hold);
-        }
-        let (_, _, _, skipped) = sync.stats();
-        assert_eq!(skipped, 0);
-    }
-
-    #[test]
-    fn test_stats_count_skip_once_per_cycle() {
-        let mut sync = AVSync::new();
-        // 5 drops → 1 skip, then 5 more drops → 1 skip
-        for _ in 0..5 {
-            sync.should_render_frame(100.0, 200.0);
-        }
-        for _ in 0..5 {
-            sync.should_render_frame(100.0, 200.0);
-        }
-        let (_, dropped, _, skipped) = sync.stats();
-        assert_eq!(skipped, 2);
-        // 10 drops counted + 2 skipped events (skip also increments frames_dropped)
-        assert_eq!(dropped, 10);
-    }
-
-    #[test]
-    fn test_skip_resets_consecutive_drops() {
-        let mut sync = AVSync::new();
-        // After SkipToKeyframe, consecutive_drops resets
-        // So the NEXT drop is just a normal Drop, not another SkipToKeyframe
-        for _ in 0..4 {
-            sync.should_render_frame(100.0, 200.0); // Drop
-        }
-        assert_eq!(
-            sync.should_render_frame(100.0, 200.0),
-            SyncAction::SkipToKeyframe
-        );
-        // Counter reset — next is a normal Drop
-        assert_eq!(sync.should_render_frame(100.0, 200.0), SyncAction::Drop);
-        assert_eq!(sync.should_render_frame(100.0, 200.0), SyncAction::Drop);
-    }
-
-    #[test]
-    fn test_hold_resets_consecutive_drops() {
-        let mut sync = AVSync::new();
-        // 4 drops, then a hold, then more drops — should NOT skip at 5
-        for _ in 0..4 {
-            sync.should_render_frame(100.0, 200.0); // Drop
-        }
-        sync.should_render_frame(1000.0, 100.0); // Hold — resets counter
-        // Now need 5 MORE drops for SkipToKeyframe
-        for _ in 0..4 {
-            assert_eq!(sync.should_render_frame(100.0, 200.0), SyncAction::Drop);
-        }
-        assert_eq!(
-            sync.should_render_frame(100.0, 200.0),
-            SyncAction::SkipToKeyframe
-        );
-    }
-
-    #[test]
-    fn test_negative_pts() {
-        let mut sync = AVSync::new();
-        // Negative PTS values (shouldn't happen but must not panic)
-        let result = sync.should_render_frame(-100.0, 0.0);
-        // diff = -100 - 0 = -100 → Drop
-        assert_eq!(result, SyncAction::Drop);
+    fn test_negative_pts_diff_uses_default() {
+        let mut sync = make_sync_24fps();
+        sync.decide(100.0, 100.0, 0.0);
+        sync.decide(50.0, 100.0, 50.0);
+        assert!((sync.last_duration_ms - 41.67).abs() < 0.1);
     }
 
     #[test]
     fn test_large_pts_values() {
-        let mut sync = AVSync::new();
-        // Very large PTS (2+ hours = 7_200_000 ms)
-        let result = sync.should_render_frame(7_200_000.0, 7_200_000.0);
-        assert_eq!(result, SyncAction::Render);
+        let mut sync = make_sync_24fps();
+        let t = 7_200_000.0;
+        sync.decide(t, t, t);
+        let action = sync.decide(t + 41.67, t + 41.67, t + 42.0);
+        assert_eq!(action, SyncAction::Render);
     }
 
     #[test]
-    fn test_set_has_audio_toggle() {
-        let mut sync = AVSync::new();
-        assert!(!sync.has_audio);
-        sync.set_has_audio(true);
-        assert!(sync.has_audio);
-        sync.set_has_audio(false);
-        assert!(!sync.has_audio);
-    }
+    fn test_smooth_24fps_playback() {
+        let mut sync = make_sync_24fps();
+        let frame_dur = 1000.0 / 24.0;
+        let tick_interval = 1000.0 / 60.0; // 60fps display
+        let mut now = 0.0;
+        let mut next_pts = 0.0;
+        let mut rendered = 0u32;
+        let mut held = 0u32;
+        let total_frames = 120;
+        let mut frame_idx = 0;
 
-    #[test]
-    fn test_start_offset_affects_sync() {
-        let mut sync = AVSync::new();
-        sync.set_start_offset(1000.0);
-        // clock=1000, offset=1000 → adjusted=0, frame=0 → diff=0 → Render
-        assert_eq!(sync.should_render_frame(0.0, 1000.0), SyncAction::Render);
-        // clock=1000, offset=1000 → adjusted=0, frame=100 → diff=100 → Hold
-        assert_eq!(sync.should_render_frame(100.0, 1000.0), SyncAction::Hold);
-    }
-
-    #[test]
-    fn test_fps_change_mid_playback() {
-        let mut sync = AVSync::new();
-        sync.set_fps(24.0);
-        assert!((sync.threshold_ms() - 25.0).abs() < 0.1);
-
-        // Change FPS mid-playback (e.g., variable frame rate content)
-        sync.set_fps(60.0);
-        assert!((sync.threshold_ms() - 10.0).abs() < 0.1);
-
-        // Reset to 0 → back to default
-        sync.set_fps(0.0);
-        assert_eq!(sync.threshold_ms(), DEFAULT_SYNC_THRESHOLD_MS);
-    }
-
-    #[test]
-    fn test_many_renders_stats_accumulate() {
-        let mut sync = AVSync::new();
-        for i in 0..1000 {
-            sync.should_render_frame(i as f64, i as f64); // Render each time
+        while frame_idx < total_frames && now < 6000.0 {
+            let clock = now;
+            let action = sync.decide(next_pts, clock, now);
+            match action {
+                SyncAction::Render => {
+                    rendered += 1;
+                    frame_idx += 1;
+                    next_pts += frame_dur;
+                }
+                SyncAction::Hold => {
+                    held += 1;
+                }
+                SyncAction::Drop => {
+                    frame_idx += 1;
+                    next_pts += frame_dur;
+                }
+                SyncAction::SkipToKeyframe => break,
+            }
+            now += tick_interval;
         }
-        let (rendered, dropped, held, skipped) = sync.stats();
-        assert_eq!(rendered, 1000);
-        assert_eq!(dropped, 0);
-        assert_eq!(held, 0);
-        assert_eq!(skipped, 0);
+
+        assert!(rendered >= 110, "expected ~120 renders, got {}", rendered);
+        assert!(held > 0, "expected holds at 60fps display");
+        let (_r, _d, _h, s) = sync.stats();
+        assert_eq!(s, 0, "no skips in smooth playback");
     }
 
     #[test]
-    fn test_interleaved_actions() {
-        let mut sync = AVSync::new();
-        // Render, Hold, Drop, Render, Drop, Drop, Drop, Drop, SkipToKeyframe
-        assert_eq!(sync.should_render_frame(100.0, 100.0), SyncAction::Render);
-        assert_eq!(sync.should_render_frame(200.0, 100.0), SyncAction::Hold);
-        assert_eq!(sync.should_render_frame(100.0, 200.0), SyncAction::Drop);
-        assert_eq!(sync.should_render_frame(300.0, 300.0), SyncAction::Render);
-        // Now 5 consecutive drops → skip
-        for _ in 0..4 {
-            sync.should_render_frame(100.0, 300.0);
-        }
-        assert_eq!(
-            sync.should_render_frame(100.0, 300.0),
-            SyncAction::SkipToKeyframe
-        );
+    fn test_decode_latency_burst() {
+        let mut sync = make_sync_24fps();
+        let fd = 1000.0 / 24.0;
+        // Frame 0 at t=0
+        assert_eq!(sync.decide(0.0, 0.0, 0.0), SyncAction::Render);
 
-        let (r, d, h, s) = sync.stats();
-        assert_eq!(r, 2);
-        assert_eq!(d, 6); // 1 + 5
-        assert_eq!(h, 1);
-        assert_eq!(s, 1);
+        // 80ms decode latency burst: frames 1,2 arrive at t=80
+        let a1 = sync.decide(fd, 80.0, 80.0);
+        assert_eq!(a1, SyncAction::Render);
+
+        // Frame 2 at same wall time
+        let a2 = sync.decide(2.0 * fd, 80.0, 80.0);
+        // After snap, frame_timer ≈ 80, so next frame might need to wait
+        assert!(a2 == SyncAction::Render || a2 == SyncAction::Hold);
+    }
+
+    #[test]
+    fn test_consecutive_holds_no_skip() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+        // Video far AHEAD of audio: delay is doubled, frame_timer+delay > now.
+        // Keep now small (< frame_timer + doubled_delay).
+        for i in 1..=100 {
+            // clock is negative → video is "ahead" → delay doubled
+            // ft(0) + 83.33 = 83.33 > now (i as f64 * 0.1)
+            let action = sync.decide(50000.0, -1000.0, i as f64 * 0.1);
+            assert_eq!(action, SyncAction::Hold, "iteration {}", i);
+        }
+        assert_eq!(sync.frames_skipped, 0);
+    }
+
+    #[test]
+    fn test_no_sync_correction_beyond_10s() {
+        let mut sync = make_sync_24fps();
+        sync.decide(0.0, 0.0, 0.0);
+        // 15s drift → no correction, use default delay
+        let action = sync.decide(41.67, 15_000.0, 42.0);
+        assert_eq!(action, SyncAction::Render);
     }
 }
