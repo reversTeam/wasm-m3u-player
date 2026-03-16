@@ -1333,6 +1333,413 @@ impl Ac3Decoder {
         Ok(())
     }
 
+    /// Read and process one E-AC-3 audio block.
+    /// E-AC-3 differs from AC-3: block switch, dither, exponent strategies, coupling flags,
+    /// SNR offsets, and BA params are all frame-level (in EacBsi), not per-block.
+    /// The audio block still contains: dynamic range, coupling strategy details & coordinates,
+    /// rematrixing flags, channel bandwidth codes, exponent data, delta BA, skip field,
+    /// and mantissa data.
+    fn read_eac3_audio_block(
+        &mut self,
+        br: &mut BitReader,
+        eac_bsi: &EacBsi,
+        ab: &mut AudioBlock,
+        blk: usize,
+    ) -> Result<(), DecodeError> {
+        let nfchans = eac_bsi.nfchans;
+        let acmod = eac_bsi.acmod;
+
+        // 1. Block switch & dither — from BSI (already parsed at frame level)
+        for ch in 0..nfchans.min(MAX_CHANNELS) {
+            ab.blksw[ch] = eac_bsi.blksw[ch][blk];
+            ab.dithflag[ch] = eac_bsi.dithflag[ch][blk];
+        }
+
+        // 2. Dynamic range compression (same as AC-3)
+        if br.read_bool() { br.skip(8); }
+        if acmod == 0x0 {
+            if br.read_bool() { br.skip(8); }
+        }
+
+        // 3. Spectral extension — skip for MVP
+        // If spxinu[blk] is set, SPX data would be in the block. For MVP we don't parse it.
+        // Most content doesn't use SPX, so this is acceptable for a first working decoder.
+
+        // 4. Coupling strategy (E-AC-3 style)
+        // cplinu[blk] is known from BSI, but coupling PARAMETERS are still in the audio block.
+        if eac_bsi.cplinu[blk] {
+            // Determine if we need to read a new coupling strategy
+            let read_cpl_strategy = if blk == 0 {
+                // Block 0: always read full coupling strategy
+                true
+            } else if !eac_bsi.cplinu[blk.saturating_sub(1)] {
+                // Coupling just turned on — read strategy
+                true
+            } else {
+                // Coupling was on in previous block too — read cplstre flag
+                br.read_bool()
+            };
+
+            if read_cpl_strategy {
+                ab.cplinu = true;
+
+                for ch in 0..nfchans.min(MAX_CHANNELS) {
+                    ab.chincpl[ch] = br.read_bool();
+                }
+                if acmod == 0x2 {
+                    ab.phsflginu = br.read_bool();
+                }
+
+                ab.cplbegf = br.read(4) as usize;
+                ab.cplendf = br.read(4) as usize;
+
+                if ab.cplendf + 3 < ab.cplbegf {
+                    return Err(DecodeError::BlockError("E-AC-3: cplendf < cplbegf".into()));
+                }
+                ab.ncplsubnd = 3 + ab.cplendf - ab.cplbegf;
+                if ab.ncplsubnd > 18 {
+                    return Err(DecodeError::BlockError(
+                        format!("E-AC-3: ncplsubnd {} > 18", ab.ncplsubnd),
+                    ));
+                }
+                ab.ncplbnd = ab.ncplsubnd;
+                ab.cplbndstrc[0] = false;
+                for bnd in 1..ab.ncplsubnd {
+                    ab.cplbndstrc[bnd] = br.read_bool();
+                    if ab.cplbndstrc[bnd] { ab.ncplbnd -= 1; }
+                }
+            } else {
+                // Reuse previous coupling strategy
+                ab.cplinu = true;
+            }
+        } else {
+            if ab.cplinu {
+                // Coupling was active, now disabled
+                ab.cplinu = false;
+                for ch in 0..nfchans.min(MAX_CHANNELS) {
+                    ab.chincpl[ch] = false;
+                }
+            }
+        }
+
+        // 5. Coupling coordinates (identical to AC-3)
+        if ab.cplinu {
+            for ch in 0..nfchans.min(MAX_CHANNELS) {
+                if ab.chincpl[ch] {
+                    ab.cplcoe[ch] = br.read_bool();
+                    if ab.cplcoe[ch] {
+                        let mstrcplco = br.read(2) as i32;
+                        for sbnd in 0..ab.ncplsubnd.min(18) {
+                            if sbnd == 0 || !ab.cplbndstrc[sbnd] {
+                                let cplcoexp = br.read(4) as i32;
+                                let cplcomant = br.read(4) as i32;
+                                let cplco = if cplcoexp == 15 {
+                                    cplcomant as f32 / 16.0
+                                } else {
+                                    (cplcomant as f32 + 16.0) / 32.0
+                                };
+                                let scale = 2.0f32.powi(-(cplcoexp + 3 * mstrcplco));
+                                ab.cplco[ch][sbnd] = cplco * scale;
+                            } else {
+                                ab.cplco[ch][sbnd] = ab.cplco[ch][sbnd.saturating_sub(1)];
+                            }
+                        }
+                    }
+                }
+            }
+            // Phase flags
+            if acmod == 0x2 && ab.phsflginu && (ab.cplcoe[0] || ab.cplcoe[1]) {
+                for _bnd in 0..ab.ncplbnd {
+                    br.skip(1); // phsflg — ignored for now
+                }
+            }
+        }
+
+        // 6. Rematrixing (stereo only, identical to AC-3)
+        if acmod == 0x2 {
+            let rematstr = br.read_bool();
+            if rematstr {
+                ab.nrematbnds = if !ab.cplinu || ab.cplbegf > 2 {
+                    4
+                } else if ab.cplbegf > 0 {
+                    3
+                } else {
+                    2
+                };
+                for rbnd in 0..ab.nrematbnds {
+                    ab.rematflg[rbnd] = br.read_bool();
+                }
+            }
+        }
+
+        // 7. Channel bandwidth codes
+        // Only read if exp strategy is NOT reuse and channel is NOT coupled
+        for ch in 0..nfchans.min(MAX_CHANNELS) {
+            if eac_bsi.chexpstr[ch][blk] != 0 {
+                if !ab.chincpl[ch] {
+                    ab.chbwcod[ch] = br.read(6) as usize;
+                }
+            }
+        }
+
+        // 8. Exponent data — strategies come from BSI
+        // Coupling exponents
+        if ab.cplinu {
+            ab.cplstrtmant = ab.cplbegf * 12 + 37;
+            ab.cplendmant = (ab.cplendf + 3) * 12 + 37;
+
+            let cplexpstr = eac_bsi.cplexpstr[blk];
+            if cplexpstr != 0 {
+                let grpsize = EXPONENT_GROUP_SIZE[cplexpstr as usize];
+                let ncplgrps = if grpsize > 0 {
+                    (ab.cplendmant - ab.cplstrtmant) / (grpsize * 3)
+                } else { 0 };
+                let cplabsexp = br.read(4) as i32;
+                unpack_exponents(br, &mut ab.cplexps, cplabsexp << 1, ncplgrps, grpsize, 0);
+            }
+        }
+
+        // Channel exponents (using BSI strategy)
+        for ch in 0..nfchans.min(MAX_CHANNELS) {
+            let expstr = eac_bsi.chexpstr[ch][blk];
+            if expstr != 0 {
+                ab.strtmant[ch] = 0;
+                if ab.chincpl[ch] {
+                    ab.endmant[ch] = 37 + 12 * ab.cplbegf;
+                } else {
+                    ab.endmant[ch] = 37 + 3 * (ab.chbwcod[ch] + 12);
+                }
+
+                let grpsize = EXPONENT_GROUP_SIZE[expstr as usize];
+                let nchgrps = match expstr {
+                    1 => (ab.endmant[ch] - 1) / 3,
+                    2 => (ab.endmant[ch] + 2) / 6,
+                    3 => (ab.endmant[ch] + 8) / 12,
+                    _ => 0,
+                };
+
+                let absexp = br.read(4) as i32;
+                unpack_exponents(br, &mut ab.exps[ch], absexp, nchgrps, grpsize, 1);
+
+                let _gainrng = br.read(2);
+            }
+        }
+
+        // LFE exponents (using BSI strategy)
+        if eac_bsi.lfeon {
+            let lfeexpstr = eac_bsi.lfeexpstr[blk];
+            if lfeexpstr != 0 {
+                let lfeabsexp = br.read(4) as i32;
+                let grpsize = EXPONENT_GROUP_SIZE[lfeexpstr as usize];
+                unpack_exponents(br, &mut ab.lfeexps, lfeabsexp, 2, grpsize, 1);
+            }
+        }
+
+        // 9. Bit allocation — use BSI-level params
+        let ba_params = BaParams {
+            sdecay: SLOW_DECAY[eac_bsi.sdcycod.min(3)] as i32,
+            fdecay: FAST_DECAY[eac_bsi.fdcycod.min(3)] as i32,
+            sgain: SLOW_GAIN[eac_bsi.sgaincod.min(3)] as i32,
+            dbknee: DB_PER_BIT[eac_bsi.dbpbcod.min(3)] as i32,
+            floor: FLOOR[eac_bsi.floorcod.min(7)] as i32,
+        };
+
+        // Delta bit allocation (per block, in bitstream)
+        let deltbaie = br.read_bool();
+        if deltbaie {
+            if ab.cplinu { ab.cpldeltbae = br.read(2) as u8; }
+            for ch in 0..nfchans.min(MAX_CHANNELS) {
+                ab.deltbae[ch] = br.read(2) as u8;
+            }
+
+            if ab.cplinu && ab.cpldeltbae == 1 {
+                let _nseg = br.read(3) as usize;
+                // Note: coupling delta BA segments not stored for simplicity
+            }
+            for ch in 0..nfchans.min(MAX_CHANNELS) {
+                if ab.deltbae[ch] == 1 {
+                    ab.deltnseg[ch] = br.read(3) as usize;
+                    for seg in 0..=ab.deltnseg[ch].min(7) {
+                        ab.deltoffst[ch][seg] = br.read(5) as usize;
+                        ab.deltlen[ch][seg] = br.read(4) as usize;
+                        ab.deltba[ch][seg] = br.read(3) as usize;
+                    }
+                }
+            }
+        } else if blk == 0 {
+            ab.cpldeltbae = 2;
+            for ch in 0..nfchans.min(MAX_CHANNELS) {
+                ab.deltbae[ch] = 2;
+            }
+        }
+
+        // Run BA for each channel (using BSI SNR offsets)
+        for ch in 0..nfchans.min(MAX_CHANNELS) {
+            let snroffset = (((eac_bsi.csnroffst - 15) << 4) + eac_bsi.fsnroffst[ch]) << 2;
+            let fgain = FAST_GAIN[eac_bsi.fgaincod[ch].min(7)] as i32;
+
+            let delt = if ab.deltbae[ch] == 0 || ab.deltbae[ch] == 1 {
+                Some(DeltBAOwned {
+                    nseg: ab.deltnseg[ch],
+                    offst: ab.deltoffst[ch],
+                    ba: ab.deltba[ch],
+                    len: ab.deltlen[ch],
+                })
+            } else { None };
+
+            let mut exps_copy = [0u8; 256];
+            exps_copy.copy_from_slice(&ab.exps[ch]);
+
+            bit_allocation(
+                eac_bsi.fscod, &ba_params,
+                ab.strtmant[ch], ab.endmant[ch],
+                &exps_copy, fgain, snroffset,
+                0, 0, delt.as_ref(), &mut ab.baps[ch],
+            );
+        }
+
+        // Coupling BA
+        if ab.cplinu {
+            let snroffset = (((eac_bsi.csnroffst - 15) << 4) + eac_bsi.cplfsnroffst) << 2;
+            let fgain = FAST_GAIN[eac_bsi.cplfgaincod.min(7)] as i32;
+
+            let mut exps_copy = [0u8; 256];
+            exps_copy.copy_from_slice(&ab.cplexps);
+
+            bit_allocation(
+                eac_bsi.fscod, &ba_params,
+                ab.cplstrtmant, ab.cplendmant,
+                &exps_copy, fgain, snroffset,
+                0, 0, None, &mut ab.cplbap,
+            );
+        }
+
+        // LFE BA
+        if eac_bsi.lfeon {
+            let snroffset = (((eac_bsi.csnroffst - 15) << 4) + eac_bsi.lfefsnroffst) << 2;
+            let fgain = FAST_GAIN[eac_bsi.lfefgaincod.min(7)] as i32;
+
+            let mut exps_copy = [0u8; 256];
+            exps_copy.copy_from_slice(&ab.lfeexps);
+
+            bit_allocation(
+                eac_bsi.fscod, &ba_params, 0, LFE_COEFS,
+                &exps_copy, fgain, snroffset,
+                0, 0, None, &mut ab.lfebap,
+            );
+        }
+
+        // 10. Skip field
+        if br.read_bool() {
+            let skipl = br.read(9) as usize;
+            br.skip(skipl * 8);
+        }
+
+        // 11. Mantissas — identical to AC-3
+        let mut mant_reader = MantissaReader::new();
+
+        let mut got_cplchan = false;
+        for ch in 0..nfchans.min(MAX_CHANNELS) {
+            ab.chmant[ch] = [0.0; 256];
+
+            for bin in 0..ab.endmant[ch].min(256) {
+                let bap = ab.baps[ch][bin];
+                let exp = ab.exps[ch][bin];
+                let scale = 2.0f32.powi(-(exp as i32));
+
+                if bap != 0 || !ab.dithflag[ch] {
+                    ab.chmant[ch][bin] = mant_reader.get(bap, br) * scale;
+                } else {
+                    ab.chmant[ch][bin] = self.dither() * scale;
+                }
+            }
+
+            // Get coupling mantissas (once, shared between coupled channels)
+            if ab.cplinu && ab.chincpl[ch] && !got_cplchan {
+                let ncplmant = (12 * ab.ncplsubnd).min(256);
+                for bin in 0..ncplmant {
+                    let bap = ab.cplbap[bin];
+                    let exp = ab.cplexps[bin];
+                    let scale = 2.0f32.powi(-(exp as i32));
+                    ab.cplmant[bin] = mant_reader.get(bap, br) * scale;
+                }
+                got_cplchan = true;
+            }
+        }
+
+        // LFE mantissas
+        if eac_bsi.lfeon {
+            for bin in 0..LFE_COEFS {
+                let bap = ab.lfebap[bin];
+                let exp = ab.lfeexps[bin];
+                let scale = 2.0f32.powi(-(exp as i32));
+                ab.lfemant[bin] = mant_reader.get(bap, br) * scale;
+            }
+        }
+
+        // 12. Decouple channels (identical to AC-3)
+        if ab.cplinu {
+            for ch in 0..nfchans.min(MAX_CHANNELS) {
+                if ab.chincpl[ch] {
+                    for sbnd in 0..ab.ncplsubnd.min(18) {
+                        for bin in 0..12 {
+                            let cpl_bin = sbnd * 12 + bin;
+                            if cpl_bin >= 256 { break; }
+                            let mantissa = if ab.cplmant[cpl_bin] == 0.0 && ab.dithflag[ch] {
+                                let exp = ab.cplexps[cpl_bin];
+                                self.dither() * 2.0f32.powi(-(exp as i32))
+                            } else {
+                                ab.cplmant[cpl_bin]
+                            };
+                            let out_bin = (sbnd + ab.cplbegf) * 12 + bin + 37;
+                            if out_bin < 256 {
+                                ab.chmant[ch][out_bin] = mantissa * ab.cplco[ch][sbnd] * 8.0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 13. Rematrixing (stereo only, identical to AC-3)
+        if acmod == 0x2 {
+            for i in 0..ab.nrematbnds {
+                if ab.rematflg[i] {
+                    let begin = REMATRIX_BANDS[i];
+                    let mut end = REMATRIX_BANDS[i + 1];
+                    if ab.cplinu && end >= 36 + ab.cplbegf * 12 {
+                        end = 36 + ab.cplbegf * 12;
+                    }
+                    for bin in begin..end.min(256) {
+                        let left = ab.chmant[0][bin];
+                        let right = ab.chmant[1][bin];
+                        ab.chmant[0][bin] = left + right;
+                        ab.chmant[1][bin] = left - right;
+                    }
+                }
+            }
+        }
+
+        // 14. IMDCT (identical to AC-3)
+        for ch in 0..nfchans.min(MAX_CHANNELS) {
+            self.imdcts[ch].process256(&ab.chmant[ch], &mut self.samples[ch], blk * BLOCK_SAMPLES);
+        }
+
+        // LFE IMDCT
+        if eac_bsi.lfeon {
+            let lfe_ch = nfchans;
+            if lfe_ch < MAX_CHANNELS {
+                let mut lfe_coeffs = [0.0f32; 256];
+                for i in 0..LFE_COEFS {
+                    lfe_coeffs[i] = ab.lfemant[i];
+                }
+                self.imdcts[lfe_ch].process256(&lfe_coeffs, &mut self.samples[lfe_ch], blk * BLOCK_SAMPLES);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Generate a dither value for bap=0 coefficients.
     fn dither(&mut self) -> f32 {
         self.dither_state = self.dither_state.wrapping_mul(1103515245).wrapping_add(12345);
