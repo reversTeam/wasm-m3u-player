@@ -103,6 +103,9 @@ pub struct Player {
     mdat_offset: usize,
     /// Size of the mdat box header (8 or 16 bytes).
     mdat_header_size: usize,
+    /// Saved bytes before mdat (ftyp + any other pre-mdat boxes).
+    /// Needed for Range seek: download.data may be replaced/emptied between seeks.
+    mp4_ftyp_bytes: Option<Vec<u8>>,
 
     // --- Range-first seeking ---
     /// Seek index mapping keyframe timestamps to byte offsets.
@@ -172,6 +175,10 @@ pub struct Player {
     /// The WebCodecs decoder pipeline may still contain frames from before the skip.
     /// Once a frame >= this PTS arrives, the filter is cleared.
     skip_frames_before_us: Option<f64>,
+    /// Audio skip filter: discard audio chunks with PTS < this value after seek.
+    /// Without this, audio starts ~50-200ms before the video keyframe because
+    /// audio samples are more granular and the demuxer positions audio earlier.
+    audio_skip_before_us: Option<f64>,
     /// Status before seek started (to restore after).
     pre_seek_status: Option<PlaybackStatus>,
 
@@ -243,12 +250,14 @@ impl Player {
             moov_data: None,
             mdat_offset: 0,
             mdat_header_size: 0,
+            mp4_ftyp_bytes: None,
             seek_index: SeekIndex::new(),
             range_buffer: None,
             prefetch: PrefetchState::new(),
             playback_start_time: 0.0,
             clock_synced_to_first_frame: false,
             skip_frames_before_us: None,
+            audio_skip_before_us: None,
             pre_seek_status: None,
             demuxer_media_info: None,
             pending_recovery_keyframe: None,
@@ -489,25 +498,87 @@ impl Player {
                     "[player] SeekIndex built: {} entries", self.seek_index.len()
                 ).into());
 
-                // Detect mdat position for build_demux_buffer mdat-patching
+                // Detect mdat position for build_demux_buffer mdat-patching.
+                // For faststart (ftyp|moov|mdat), header_data only covers up to moov_end,
+                // so mdat might not be in header_data. Try header_data first, then probe_data,
+                // then deduce from moov position.
                 let boxes = Mp4Demuxer::scan_top_level_boxes(&header_data);
-                if let Some(mdat) = boxes.iter().find(|b| b.is_type(b"mdat")) {
-                    self.mdat_offset = mdat.offset as usize;
-                    let i = mdat.offset as usize;
-                    if i + 4 <= header_data.len() {
+                let mdat_in_header = boxes.iter().find(|b| b.is_type(b"mdat")).cloned();
+
+                let mdat_found = if let Some(ref mdat) = mdat_in_header {
+                    // mdat found in header_data (moov-at-end layout typically)
+                    Some((mdat.offset, mdat.size, &header_data[..]))
+                } else {
+                    // Faststart: mdat is after moov, not in header_data.
+                    // Scan probe_data which may contain more of the file.
+                    let probe_boxes = Mp4Demuxer::scan_top_level_boxes(probe_data);
+                    if let Some(mdat) = probe_boxes.iter().find(|b| b.is_type(b"mdat")) {
+                        Some((mdat.offset, mdat.size, probe_data))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some((mdat_offset, _mdat_size, src_data)) = mdat_found {
+                    self.mdat_offset = mdat_offset as usize;
+                    let i = mdat_offset as usize;
+                    if i + 4 <= src_data.len() {
                         let size_u32 = u32::from_be_bytes([
-                            header_data[i], header_data[i + 1],
-                            header_data[i + 2], header_data[i + 3],
+                            src_data[i], src_data[i + 1],
+                            src_data[i + 2], src_data[i + 3],
                         ]);
                         self.mdat_header_size = if size_u32 == 1 { 16 } else { 8 };
                     } else {
                         self.mdat_header_size = 8;
                     }
+                } else {
+                    // Last resort: mdat must be right after moov for faststart
+                    self.mdat_offset = moov_end as usize;
+                    self.mdat_header_size = 8;
                     console::log_1(&format!(
-                        "[player] faststart mdat at offset={}, header_size={}",
-                        self.mdat_offset, self.mdat_header_size
+                        "[player] mdat not found in scans, assuming at moov_end={}",
+                        moov_end
                     ).into());
                 }
+
+                // Save just the ftyp box (NOT the whole prefix before mdat).
+                // For Range seek we rebuild: [ftyp][mdat_empty][moov][range_data]
+                // so ftyp and moov must be saved separately to avoid duplication.
+                let ftyp_box = boxes.iter().find(|b| b.is_type(b"ftyp"));
+                if let Some(fb) = ftyp_box {
+                    let fe = (fb.offset + fb.size) as usize;
+                    if fe <= header_data.len() {
+                        self.mp4_ftyp_bytes = Some(header_data[fb.offset as usize..fe].to_vec());
+                    }
+                } else {
+                    // No ftyp in header_data? Try probe_data
+                    let probe_boxes = Mp4Demuxer::scan_top_level_boxes(probe_data);
+                    if let Some(fb) = probe_boxes.iter().find(|b| b.is_type(b"ftyp")) {
+                        let fe = (fb.offset + fb.size) as usize;
+                        if fe <= probe_data.len() {
+                            self.mp4_ftyp_bytes = Some(probe_data[fb.offset as usize..fe].to_vec());
+                        }
+                    }
+                }
+
+                // Save moov bytes separately for Range seek header reconstruction
+                if self.moov_data.is_none() {
+                    let moov_box = boxes.iter().find(|b| b.is_type(b"moov"));
+                    if let Some(moov_b) = moov_box {
+                        let ms = moov_b.offset as usize;
+                        let me = (moov_b.offset + moov_b.size) as usize;
+                        if me <= header_data.len() {
+                            self.moov_data = Some(header_data[ms..me].to_vec());
+                        }
+                    }
+                }
+
+                console::log_1(&format!(
+                    "[player] mdat_offset={}, header_size={}, ftyp_bytes={}, moov_data={}",
+                    self.mdat_offset, self.mdat_header_size,
+                    self.mp4_ftyp_bytes.as_ref().map_or(0, |v| v.len()),
+                    self.moov_data.as_ref().map_or(0, |v| v.len()),
+                ).into());
 
                 // Store header data in download buffer for demuxing
                 {
@@ -753,25 +824,44 @@ impl Player {
             let mut window_start = js_sys::Date::now();
 
             loop {
-                // Check cancellation or pause
-                {
-                    let dl = download.borrow();
-                    if dl.cancelled {
-                        break;
-                    }
-                    if dl.paused {
+                // Check cancellation or pause (try_borrow to avoid panic
+                // if seek holds a borrow_mut on the same RefCell)
+                match download.try_borrow() {
+                    Ok(dl) => {
+                        if dl.cancelled { break; }
+                        let paused = dl.paused;
                         drop(dl);
-                        fetch::sleep_ms(50).await;
-                        continue;
+                        if paused {
+                            fetch::sleep_ms(50).await;
+                            continue;
+                        }
                     }
+                    Err(_) => break, // RefCell busy — bail out
                 }
 
                 match stream.read_chunk().await {
                     Ok(Some(chunk)) => {
+                        // Re-check cancellation after await — seek may have fired
+                        // while we were waiting for the network response.
+                        // Use try_borrow to avoid panic if seek holds a borrow_mut.
+                        match download.try_borrow() {
+                            Ok(dl) => {
+                                if dl.cancelled { break; }
+                            }
+                            Err(_) => {
+                                // RefCell is mutably borrowed by seek — bail out
+                                break;
+                            }
+                        }
                         let chunk_len = chunk.len() as u64;
-                        {
-                            let mut dl = download.borrow_mut();
-                            dl.data.extend_from_slice(&chunk);
+                        match download.try_borrow_mut() {
+                            Ok(mut dl) => {
+                                dl.data.extend_from_slice(&chunk);
+                            }
+                            Err(_) => {
+                                // RefCell busy — skip this chunk, try next iteration
+                                continue;
+                            }
                         }
 
                         // Rate limiting
@@ -992,6 +1082,9 @@ impl Player {
             // current time (which was frozen during suspend)
             if self.audio_pipeline.is_configured() {
                 self.audio_pipeline.reset_schedule();
+                self.audio_pipeline.set_schedule_origin(
+                    self.state.current_time_ms as f64 / 1000.0
+                );
             }
         } else {
             // Fresh start from Ready state
@@ -999,6 +1092,7 @@ impl Player {
             self.av_sync.resync_timer(now_ms());
             self.clock_synced_to_first_frame = false;
             self.skip_frames_before_us = None;
+            self.audio_skip_before_us = None;
         }
 
         self.state.status = PlaybackStatus::Playing;
@@ -1246,6 +1340,26 @@ impl Player {
                         }
                     }
                 } else if chunk.is_audio && self.audio_pipeline.is_configured() {
+                    // Skip audio chunks before the video keyframe PTS (after seek).
+                    // The demuxer positions audio earlier than video — without this
+                    // filter, audio plays ahead of video by ~50-200ms.
+                    if let Some(min_us) = self.audio_skip_before_us {
+                        if (chunk.timestamp_us as f64) < min_us {
+                            // Discard pre-keyframe audio
+                            console::log_1(&format!(
+                                "[audio-skip] DROPPED audio ts={}ms < keyframe={}ms",
+                                chunk.timestamp_us / 1000, min_us as i64 / 1000
+                            ).into());
+                            decoded += 1;
+                            continue;
+                        }
+                        // First audio chunk at or after keyframe — clear filter
+                        console::log_1(&format!(
+                            "[audio-skip] FIRST valid audio ts={}ms (keyframe={}ms)",
+                            chunk.timestamp_us / 1000, min_us as i64 / 1000
+                        ).into());
+                        self.audio_skip_before_us = None;
+                    }
                     if audio_dead {
                         // Skip — decoder is dead
                     } else if let Err(e) = self.audio_pipeline.decode(&chunk) {
@@ -1343,9 +1457,12 @@ impl Player {
                 let total = r + d + h;
                 if total <= 30 {
                     console::log_1(&format!(
-                        "[sync-dbg] #{}: pts={:.1}ms, clock={:.1}ms, diff={:.1}ms, now={:.1} → {:?} (q={})",
-                        total, pts_ms, clock_ms, pts_ms - clock_ms, wall_now, action,
-                        self.video_decoder.queue_len()
+                        "[sync-dbg] #{}: vPTS={:.1}ms, clock={:.1}ms, drift={:.1}ms, aNPT={:.3}s → {:?} (vq={}, aq={})",
+                        total, pts_ms, clock_ms, pts_ms - clock_ms,
+                        self.audio_pipeline.next_play_time(),
+                        action,
+                        self.video_decoder.queue_len(),
+                        self.audio_pipeline.queue_len(),
                     ).into());
                 }
 
@@ -1475,8 +1592,14 @@ impl Player {
             });
         }
 
-        // 6. Pump decoded audio to Web Audio output
-        let _ = self.audio_pipeline.pump_audio();
+        // 6. Pump decoded audio to Web Audio output.
+        // IMPORTANT: Only pump during Playing — during Buffering/Seeking, audio
+        // buffers accumulate in the queue but are NOT scheduled. This prevents
+        // audio from running ahead of video during the buffering phase after seek.
+        // The queue is drained on the first Playing tick after Buffering→Playing.
+        if self.state.status == PlaybackStatus::Playing {
+            let _ = self.audio_pipeline.pump_audio();
+        }
 
         // 6. Update time (throttled to ~10Hz to reduce WASM→JS overhead)
         self.state.current_time_ms = clock_ms as u64;
@@ -1540,25 +1663,62 @@ impl Player {
                 }
             }
         } else if self.state.status == PlaybackStatus::Buffering {
-            // We have data again — resume playing
-            if let Some(since) = self.buffering_since_ms {
-                let stall_ms = wall_now - since;
-                console::log_1(&format!(
-                    "[state] Buffering → Playing (resumed after {:.0}ms)",
-                    stall_ms
-                ).into());
-                // Re-anchor the clock to prevent the buffering gap from causing
-                // all pending frames to be "late" → mass drops → SkipToKeyframe.
-                // current_time_ms was frozen during buffering, so re-sync to it.
-                self.playback_start_time = self.master_now_ms() - self.state.current_time_ms as f64;
-                self.clock_synced_to_first_frame = false;
-                self.av_sync.resync_timer(now_ms());
+            // Wait for at least one decoded video frame before resuming.
+            // After seek, chunks arrive in chunk_queue immediately but WebCodecs
+            // decoding is async — if we resume too early, the clock advances
+            // while the pipeline is still empty, causing audio loss / mass drops.
+            // NOTE: we do NOT check audio queue_len here because pump_audio()
+            // already drained it earlier in this same tick. Audio will schedule
+            // naturally once we're back in Playing state.
+            if has_video_frames {
+                if let Some(since) = self.buffering_since_ms {
+                    let stall_ms = wall_now - since;
+                    let audio_queue_len = self.audio_pipeline.queue_len();
+                    console::log_1(&format!(
+                        "[state] Buffering → Playing (after {:.0}ms, vq={}, aq={})",
+                        stall_ms,
+                        self.video_decoder.queue_len(),
+                        audio_queue_len,
+                    ).into());
+                    // Re-anchor clock + audio to the first video frame's PTS.
+                    // Use peek_timestamp to get the actual decoded frame PTS rather
+                    // than current_time_ms (which is a rough keyframe estimate).
+                    let anchor_ms = if let Some(pts_us) = self.video_decoder.peek_timestamp_us() {
+                        pts_us / 1000.0
+                    } else {
+                        self.state.current_time_ms as f64
+                    };
+                    let master_now = self.master_now_ms();
+                    self.playback_start_time = master_now - anchor_ms;
+                    self.state.current_time_ms = anchor_ms as u64;
+                    // Do NOT reset clock_synced_to_first_frame — the anchor is
+                    // already set from the actual decoded PTS above. Resetting it
+                    // would cause a second re-anchor in the next tick, creating a
+                    // 16ms drift between audio schedule and video clock.
+                    self.clock_synced_to_first_frame = true;
+                    self.av_sync.resync_timer(now_ms());
+
+                    // Reset audio schedule and immediately pump queued audio.
+                    // pump_audio() at step 6 was skipped (status was Buffering),
+                    // so we must pump here to avoid a 16ms delay to the next tick.
+                    if self.audio_pipeline.is_configured() {
+                        self.audio_pipeline.reset_schedule();
+                        self.audio_pipeline.set_schedule_origin(anchor_ms / 1000.0);
+                        let _ = self.audio_pipeline.pump_audio();
+                        console::log_1(&format!(
+                            "[state] Audio re-anchor: anchor_ms={:.1}, master_now={:.1}, next_play={:.3}, aq_after={}",
+                            anchor_ms, master_now,
+                            self.audio_pipeline.next_play_time(),
+                            self.audio_pipeline.queue_len(),
+                        ).into());
+                    }
+                }
+                self.state.status = PlaybackStatus::Playing;
+                self.buffering_since_ms = None;
+                self.emit_event(&PlayerEvent::StatusChanged {
+                    status: PlaybackStatus::Playing,
+                });
             }
-            self.state.status = PlaybackStatus::Playing;
-            self.buffering_since_ms = None;
-            self.emit_event(&PlayerEvent::StatusChanged {
-                status: PlaybackStatus::Playing,
-            });
         }
 
         // 8. Back-pressure on download
@@ -1756,18 +1916,37 @@ impl Player {
         });
         self.emit_event(&PlayerEvent::Seeking { target_ms: time_ms });
 
-        // 1. Clear chunk queue + flush decoders
+        // 1. IMMEDIATELY silence old audio — disconnect the GainNode so
+        //    previously-scheduled AudioBufferSourceNodes play into the void.
+        //    This must happen BEFORE any .await (Range fetch) so the user
+        //    doesn't hear stale audio during the seek.
+        if self.audio_pipeline.is_configured() {
+            self.audio_pipeline.flush_queue();
+            self.audio_pipeline.reset_schedule();
+        }
+
+        // 2. Clear chunk queue + flush decoders + invalidate cached demuxers
         self.chunk_queue.clear();
         self.pending_recovery_keyframe = None;
-            self.video_dead_since_tick = 0;
+        self.video_dead_since_tick = 0;
+        // Reset MP4 cached demuxer — it holds stale data from before seek.
+        // Without this, try_demux_more reuses the old demuxer whose internal
+        // buffer doesn't contain the bytes at the new seek position.
+        self.mp4_demuxer = None;
+        self.mp4_cursors = None;
+        self.mp4_cache_data_len = 0;
+        // Reset MKV cached demuxer too
+        self.mkv_demuxer = None;
 
-        // 2. Close and reconfigure decoders — WebCodecs decoders can enter
+        // 3. Close and reconfigure decoders — WebCodecs decoders can enter
         //    an unrecoverable error state; the safest approach is to recreate
         //    them from scratch on seek. This also flushes the internal pipeline.
+        //    AUDIO: only close the decoder backend, keep AudioContext alive.
+        //    Creating a new AudioContext resets currentTime to 0 which corrupts
+        //    the master clock and causes audio loss + recovery loops.
         self.video_decoder.close();
-        self.audio_pipeline.close();
+        self.audio_pipeline.close_decoder();
         self.video_decoder = VideoDecoderWrapper::new();
-        self.audio_pipeline = AudioPipeline::new();
         if let Some(ref media_info) = self.demuxer_media_info.clone() {
             self.reconfigure_decoders(media_info)?;
         }
@@ -1819,24 +1998,45 @@ impl Player {
         self.av_sync.resync_timer(now_ms());
         self.clock_synced_to_first_frame = false;
         self.skip_frames_before_us = None;
+        // Discard audio chunks with PTS before the video keyframe.
+        // After seek, the demuxer positions audio earlier than video (audio samples
+        // are more granular). Without this filter, audio plays ~50-200ms ahead.
+        self.audio_skip_before_us = Some(actual_ms * 1000.0); // ms → µs
         if self.audio_pipeline.is_configured() {
             self.audio_pipeline.reset_schedule();
+            // Set PTS-based scheduling origin: at this AudioContext moment,
+            // media time = actual_ms. Audio buffers will be scheduled based
+            // on their PTS relative to this anchor.
+            self.audio_pipeline.set_schedule_origin(actual_ms / 1000.0);
         }
         self.state.current_time_ms = actual_ms as u64;
 
-        // 6. Restore status
+        console::log_1(&format!(
+            "[seek] sync setup: actual_ms={:.1}, audio_skip_before_us={}, clock_ms={:.1}, master_now={:.1}",
+            actual_ms,
+            self.audio_skip_before_us.map_or("None".to_string(), |v| format!("{:.0}", v)),
+            self.clock_ms(),
+            self.master_now_ms(),
+        ).into());
+
+        // 6. Restore status — go through Buffering first so the render loop
+        //    can fill the decoder pipeline before actual playback resumes.
+        //    This gives the user a loader/spinner and prevents audio loss.
         let new_status = if was_playing {
-            PlaybackStatus::Playing
+            PlaybackStatus::Buffering
         } else {
             PlaybackStatus::Paused
         };
 
-        // Resume AudioContext if we were playing (new AudioContext starts suspended)
+        // Resume AudioContext if we were playing (it may be suspended from pause)
         if was_playing && self.audio_pipeline.is_configured() {
             self.audio_pipeline.resume().await?;
         }
 
         self.state.status = new_status;
+        if was_playing {
+            self.buffering_since_ms = Some(now_ms());
+        }
         self.pre_seek_status = None;
 
         self.emit_event(&PlayerEvent::Seeked {
@@ -2035,9 +2235,22 @@ impl Player {
                 } else {
                     self.mdat_header_size = 8;
                 }
+                // Save just the ftyp box for Range seek reuse.
+                // For moov-at-end (ftyp|mdat|moov), everything before mdat IS the ftyp box.
+                let ftyp_box = boxes.iter().find(|b| b.is_type(b"ftyp"));
+                if let Some(fb) = ftyp_box {
+                    let fe = (fb.offset + fb.size) as usize;
+                    if fe <= initial_data.len() {
+                        self.mp4_ftyp_bytes = Some(initial_data[fb.offset as usize..fe].to_vec());
+                    }
+                } else {
+                    // Fallback: everything before mdat
+                    self.mp4_ftyp_bytes = Some(initial_data[..self.mdat_offset].to_vec());
+                }
                 console::log_1(&format!(
-                    "[player] mdat at offset={}, header_size={}",
-                    self.mdat_offset, self.mdat_header_size
+                    "[player] mdat at offset={}, header_size={}, ftyp_bytes={}",
+                    self.mdat_offset, self.mdat_header_size,
+                    self.mp4_ftyp_bytes.as_ref().map_or(0, |v| v.len())
                 ).into());
             }
             None => {
@@ -2937,16 +3150,26 @@ impl Player {
         let fetch_end = (keyframe_offset + SEEK_WINDOW).min(file_size);
 
         // 3. Check if data is already available
-        let have_data = {
+        let dl_has_data = {
             let dl = self.download.borrow();
-            let dl_has = dl.data.len() as u64 > keyframe_offset + 512 * 1024; // At least 512KB past keyframe
-            let rb_has = self.range_buffer.as_ref()
-                .map(|rb| rb.has_range(fetch_start, (keyframe_offset + 512 * 1024).min(file_size)))
-                .unwrap_or(false);
-            dl_has || rb_has
+            dl.data.len() as u64 > keyframe_offset + 512 * 1024 // At least 512KB past keyframe
         };
+        let rb_has_data = self.range_buffer.as_ref()
+            .map(|rb| rb.has_range(fetch_start, (keyframe_offset + 512 * 1024).min(file_size)))
+            .unwrap_or(false);
 
-        if !have_data {
+        // If data is already in the linear download buffer, use local seek directly.
+        // No need to build a synthetic Range buffer — seek_demuxer works on the
+        // existing download.data which starts at byte 0.
+        if dl_has_data {
+            console::log_1(&format!(
+                "[seek] data at offset {} already in download buffer — using local seek",
+                keyframe_offset
+            ).into());
+            return self.seek_demuxer(timestamp_us);
+        }
+
+        if !rb_has_data {
             console::log_1(&format!(
                 "[seek] fetching Range: bytes {}-{} ({} KB)",
                 fetch_start, fetch_end - 1, (fetch_end - fetch_start) / 1024
@@ -2959,28 +3182,25 @@ impl Player {
                 rb.insert(fetch_start, range_data.clone());
             }
 
-            // For MP4: we need contiguous data from byte 0 for absolute offsets
-            // For MKV: we use synthetic buffer (header + cluster data)
+            // For MP4: store data in RangeBuffer only — never resize download.data
+            //   to fill gaps (would OOM: keyframe at byte 1.2GB → 1.2GB zero-fill).
+            //   The cached mp4_demuxer already has the parsed header, seek_demuxer()
+            //   reuses it directly.
+            // For MKV: data is already in RangeBuffer via insert above.
             match format {
                 ContainerFormat::Mp4 => {
-                    // Extend download buffer to cover the keyframe position
-                    let mut dl = self.download.borrow_mut();
-                    let current_len = dl.data.len() as u64;
-                    if fetch_start > current_len {
-                        // Fill gap with zeros to preserve absolute byte offsets
-                        dl.data.resize(fetch_start as usize, 0);
-                    }
-                    if fetch_start + range_data.len() as u64 > current_len {
-                        // Extend with fetched data
-                        let skip = if current_len > fetch_start {
-                            (current_len - fetch_start) as usize
-                        } else {
-                            0
-                        };
+                    // Data is already in RangeBuffer (inserted above).
+                    // If download.data happens to be contiguous, extend it.
+                    let dl_len = self.download.borrow().data.len() as u64;
+                    if fetch_start <= dl_len {
+                        // Contiguous with existing download — safe to extend
+                        let skip = (dl_len - fetch_start) as usize;
                         if skip < range_data.len() {
-                            dl.data.extend_from_slice(&range_data[skip..]);
+                            self.download.borrow_mut().data
+                                .extend_from_slice(&range_data[skip..]);
                         }
                     }
+                    // else: gap too large, rely on cached mp4_demuxer + RangeBuffer
                 }
                 ContainerFormat::Mkv | ContainerFormat::WebM => {
                     // MKV uses synthetic buffer, no need to extend download linearly
@@ -2998,35 +3218,122 @@ impl Player {
         // 5. Build demux buffer and seek
         match format {
             ContainerFormat::Mp4 => {
-                // MP4: use standard build_demux_buffer (works because download.data has the right bytes)
-                self.last_demux_data_len = 0;
-                self.seek_demuxer(timestamp_us)?;
+                // MP4 Range seek: build a virtual-offset buffer so the demuxer
+                // can read sample data from the fetched range_data, even though
+                // stco/co64 offsets point to absolute file positions (e.g., 800MB).
+                //
+                // Buffer layout: [ftyp][mdat_header(empty)][moov][range_data]
+                // The LimitedCursor remaps seeks to stco offsets >= fetch_start
+                // into the range_data region of the physical buffer.
 
-                // Start new streaming from end of fetched range
-                let resume_from = fetch_end;
-                if resume_from < file_size {
-                    let data = std::mem::take(&mut self.download.borrow_mut().data);
-                    let new_download = SharedDownload::new();
-                    {
-                        let mut dl = new_download.borrow_mut();
-                        dl.data = data;
-                        dl.content_length = file_size;
-                    }
-                    self.download = new_download;
-
-                    // Spawn prefetch for the next window ahead of playback
-                    self.spawn_prefetch(&url, fetch_end, SEEK_WINDOW, file_size);
+                // Get range_data from RangeBuffer or download
+                let range_data_for_mp4 = if let Some(rb) = &self.range_buffer {
+                    rb.get_range(fetch_start, fetch_end.min(file_size))
+                        .unwrap_or_default()
                 } else {
-                    // Reset download state (uncancelled)
-                    let data = std::mem::take(&mut self.download.borrow_mut().data);
-                    let new_download = SharedDownload::new();
-                    {
-                        let mut dl = new_download.borrow_mut();
-                        dl.data = data;
-                        dl.content_length = file_size;
+                    let dl = self.download.borrow();
+                    if (fetch_start as usize) < dl.data.len() {
+                        let end = (fetch_end as usize).min(dl.data.len());
+                        dl.data[fetch_start as usize..end].to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                };
+
+                if range_data_for_mp4.is_empty() {
+                    return Err(JsValue::from_str("No MP4 data available at seek target"));
+                }
+
+                // Build header region: [ftyp bytes][mdat_header (empty)][moov]
+                let mut header_buf = Vec::new();
+
+                console::log_1(&format!(
+                    "[seek] MP4 Range: mp4_ftyp_bytes={}, moov_data={}, mdat_offset={}, dl.data.len={}",
+                    self.mp4_ftyp_bytes.as_ref().map_or(0, |v| v.len()),
+                    self.moov_data.as_ref().map_or(0, |v| v.len()),
+                    self.mdat_offset,
+                    self.download.borrow().data.len()
+                ).into());
+
+                // Copy original file bytes before mdat (typically just ftyp, ~32 bytes)
+                if let Some(ref ftyp) = self.mp4_ftyp_bytes {
+                    header_buf.extend_from_slice(ftyp);
+                } else {
+                    // Fallback: try from download data (first seek before data is cleared)
+                    let dl = self.download.borrow();
+                    let ftyp_end = self.mdat_offset.min(dl.data.len());
+                    if ftyp_end > 0 {
+                        header_buf.extend_from_slice(&dl.data[..ftyp_end]);
+                    }
+                }
+
+                // Add empty mdat header (8 bytes: size=8, type=mdat → no content)
+                header_buf.extend_from_slice(&8u32.to_be_bytes()); // size = 8 (just header, no data)
+                header_buf.extend_from_slice(b"mdat");
+
+                // Add moov
+                if let Some(ref moov) = self.moov_data {
+                    header_buf.extend_from_slice(moov);
+                } else {
+                    // Faststart: moov is within download.data, extract it
+                    let dl = self.download.borrow();
+                    let boxes = Mp4Demuxer::scan_top_level_boxes(&dl.data);
+                    if let Some(moov_box) = boxes.iter().find(|b| b.is_type(b"moov")) {
+                        let start = moov_box.offset as usize;
+                        let end = (moov_box.offset + moov_box.size) as usize;
+                        if end <= dl.data.len() {
+                            header_buf.extend_from_slice(&dl.data[start..end]);
+                        }
+                    }
+                }
+
+                let header_end = header_buf.len() as u64;
+                let virtual_base = fetch_start;
+
+                // Combine: [header][range_data]
+                let mut full_buf = header_buf;
+                full_buf.extend_from_slice(&range_data_for_mp4);
+
+                // Log first bytes to verify box structure
+                let first_bytes: Vec<String> = full_buf.iter().take(32).map(|b| format!("{:02x}", b)).collect();
+                console::log_1(&format!(
+                    "[seek] MP4 Range buffer: header={}B, range_data={}KB, virtual_base={}, total={}KB, first32=[{}]",
+                    header_end, range_data_for_mp4.len() / 1024, virtual_base, full_buf.len() / 1024,
+                    first_bytes.join(" ")
+                ).into());
+
+                // Create new MP4 demuxer with virtual offset cursor
+                let mut demuxer = Mp4Demuxer::new();
+                demuxer.parse_header_range(full_buf, virtual_base, header_end).map_err(|e| {
+                    JsValue::from_str(&format!("MP4 Range seek parse error: {}", e))
+                })?;
+
+                // Seek to keyframe
+                demuxer.seek_to_keyframe(timestamp_us).map_err(|e| {
+                    JsValue::from_str(&format!("MP4 Range seek error: {}", e))
+                })?;
+
+                self.mp4_cursors = Some(demuxer.sample_positions());
+                self.mp4_demuxer = Some(demuxer);
+                self.mp4_cache_data_len = 0; // Force rebuild if streaming adds more data
+                self.last_demux_data_len = 0;
+
+                // Replace download with range_data for continued streaming
+                let new_download = SharedDownload::new();
+                {
+                    let mut dl = new_download.borrow_mut();
+                    // Keep download.data minimal — the cached demuxer has its own buffer
+                    dl.data = Vec::new();
+                    dl.content_length = file_size;
+                    if fetch_end >= file_size {
                         dl.complete = true;
                     }
-                    self.download = new_download;
+                }
+                self.download = new_download;
+
+                // Spawn streaming download from end of Range for continued playback
+                if fetch_end < file_size {
+                    self.spawn_streaming_download(&url, fetch_end, file_size);
                 }
             }
             ContainerFormat::Mkv | ContainerFormat::WebM => {
@@ -3100,10 +3407,15 @@ impl Player {
                 self.mkv_demuxer = Some(demuxer);
                 self.mkv_cache_created_at = dl_len;
 
-                // Spawn prefetch for the next window
-                let next_window_start = fetch_end;
-                if next_window_start < file_size {
-                    self.spawn_prefetch(&url, next_window_start, SEEK_WINDOW, file_size);
+                // Spawn streaming download from end of fetched range.
+                // Using spawn_streaming_download (not spawn_prefetch) because:
+                // - The synthetic download buffer is [header + cluster_data], dl_len ≈ 5MB
+                // - Prefetch data arrives at file offset fetch_end (e.g., 150MB)
+                // - drain_prefetch checks `offset == dl_len` → gap → data never appends
+                // - spawn_streaming_download appends sequentially to download.data,
+                //   which try_demux_more can read via build_mkv_buffer()
+                if fetch_end < file_size {
+                    self.spawn_streaming_download(&url, fetch_end, file_size);
                 }
             }
             _ => {
@@ -3442,25 +3754,37 @@ impl Player {
             let mut window_start = js_sys::Date::now();
 
             loop {
-                // Check cancellation or pause
-                {
-                    let dl = download.borrow();
-                    if dl.cancelled {
-                        break;
-                    }
-                    if dl.paused {
+                // Check cancellation or pause (try_borrow to avoid panic
+                // if seek holds a borrow_mut on the same RefCell)
+                match download.try_borrow() {
+                    Ok(dl) => {
+                        if dl.cancelled { break; }
+                        let paused = dl.paused;
                         drop(dl);
-                        fetch::sleep_ms(50).await;
-                        continue;
+                        if paused {
+                            fetch::sleep_ms(50).await;
+                            continue;
+                        }
                     }
+                    Err(_) => break, // RefCell busy — bail out
                 }
 
                 match stream.read_chunk().await {
                     Ok(Some(chunk)) => {
+                        // Re-check cancellation after await — seek may have fired
+                        // while we were waiting for the network response.
+                        match download.try_borrow() {
+                            Ok(dl) => {
+                                if dl.cancelled { break; }
+                            }
+                            Err(_) => break,
+                        }
                         let chunk_len = chunk.len() as u64;
-                        {
-                            let mut dl = download.borrow_mut();
-                            dl.data.extend_from_slice(&chunk);
+                        match download.try_borrow_mut() {
+                            Ok(mut dl) => {
+                                dl.data.extend_from_slice(&chunk);
+                            }
+                            Err(_) => break,
                         }
 
                         // Rate limiting

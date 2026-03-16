@@ -48,6 +48,11 @@ pub struct AudioPipeline {
     gain_node: Option<GainNode>,
     /// Next scheduled playback time in AudioContext seconds.
     next_play_time: f64,
+    /// PTS-based scheduling origin (set after seek).
+    /// When set, audio buffers are scheduled based on their PTS relative to this
+    /// origin rather than purely back-to-back. This ensures audio/video alignment.
+    /// (ctx_time, media_time_s): at ctx_time, media is at media_time_s.
+    schedule_origin: Option<(f64, f64)>,
 }
 
 impl AudioPipeline {
@@ -57,11 +62,15 @@ impl AudioPipeline {
             audio_ctx: None,
             gain_node: None,
             next_play_time: 0.0,
+            schedule_origin: None,
         }
     }
 
     /// Configure the audio decoder and create AudioContext.
     /// Tries WebCodecs first; falls back to software decoder for AC-3/E-AC-3.
+    /// If an AudioContext already exists (e.g. after seek), it is reused to
+    /// preserve `currentTime` continuity — creating a new one would reset the
+    /// master clock to 0 and corrupt A/V sync.
     pub fn configure(
         &mut self,
         codec: &str,
@@ -69,16 +78,16 @@ impl AudioPipeline {
         channels: u32,
         codec_config: Option<&[u8]>,
     ) -> Result<(), JsValue> {
-        // Create AudioContext (must be resumed after user interaction)
-        let audio_ctx = AudioContext::new()?;
-        self.next_play_time = audio_ctx.current_time();
+        // Reuse existing AudioContext if available (critical for seek)
+        if self.audio_ctx.is_none() {
+            let audio_ctx = AudioContext::new()?;
+            let gain = audio_ctx.create_gain()?;
+            gain.connect_with_audio_node(&audio_ctx.destination())?;
+            self.gain_node = Some(gain);
+            self.audio_ctx = Some(audio_ctx);
+        }
 
-        // Create GainNode for volume control: source → gain → destination
-        let gain = audio_ctx.create_gain()?;
-        gain.connect_with_audio_node(&audio_ctx.destination())?;
-        self.gain_node = Some(gain);
-
-        self.audio_ctx = Some(audio_ctx);
+        self.next_play_time = self.audio_ctx.as_ref().unwrap().current_time();
 
         // Check if this is an AC-3/E-AC-3 codec — use software decoder directly
         // (WebCodecs rejects these asynchronously, which causes silent failures)
@@ -250,10 +259,39 @@ impl AudioPipeline {
         }
     }
 
+    /// Set the PTS origin for PTS-based scheduling after seek.
+    /// `media_time_s` is the media position (in seconds) that should play
+    /// at the current AudioContext time. Audio buffers will be scheduled
+    /// at: ctx_origin + (buffer_pts - media_time_s).
+    pub fn set_schedule_origin(&mut self, media_time_s: f64) {
+        if let Some(ctx) = &self.audio_ctx {
+            self.schedule_origin = Some((ctx.current_time(), media_time_s));
+        }
+    }
+
     /// Reset the audio scheduling time to the current AudioContext time.
+    /// Also disconnects the old GainNode and creates a fresh one, which
+    /// silences any previously-scheduled AudioBufferSourceNodes still playing.
     pub fn reset_schedule(&mut self) {
         if let Some(ctx) = &self.audio_ctx {
             self.next_play_time = ctx.current_time();
+
+            // Save current volume before disconnecting
+            let current_volume = self.gain_node.as_ref()
+                .map(|g| g.gain().value())
+                .unwrap_or(1.0);
+
+            // Disconnect old gain node — all previously-scheduled sources
+            // were routed through it, so they'll play into the void.
+            if let Some(old_gain) = self.gain_node.take() {
+                let _ = old_gain.disconnect();
+            }
+            // Create fresh gain node with same volume
+            if let Ok(gain) = ctx.create_gain() {
+                let _ = gain.connect_with_audio_node(&ctx.destination());
+                gain.gain().set_value(current_volume);
+                self.gain_node = Some(gain);
+            }
         }
     }
 
@@ -330,12 +368,30 @@ impl AudioPipeline {
         }
 
         let current_time = ctx.current_time();
-        if self.next_play_time < current_time {
-            self.next_play_time = current_time;
-        }
+        let duration_s = num_frames as f64 / sample_rate as f64;
 
-        source.start_with_when(self.next_play_time)?;
-        self.next_play_time += num_frames as f64 / sample_rate as f64;
+        // PTS-based scheduling: compute target time from audio PTS
+        // relative to the seek origin. This ensures audio/video alignment.
+        let play_at = if let Some((ctx_origin, media_origin_s)) = self.schedule_origin {
+            let audio_pts_s = audio_data.timestamp() as f64 / 1_000_000.0;
+            let target = ctx_origin + (audio_pts_s - media_origin_s);
+            // Don't schedule in the past — but also don't jump too far ahead
+            if target >= current_time - 0.050 {
+                target.max(current_time)
+            } else {
+                // Audio PTS is way before origin — skip this buffer
+                return Ok(());
+            }
+        } else {
+            // Normal sequential scheduling (no seek origin)
+            if self.next_play_time < current_time {
+                self.next_play_time = current_time;
+            }
+            self.next_play_time
+        };
+
+        source.start_with_when(play_at)?;
+        self.next_play_time = play_at + duration_s;
 
         Ok(())
     }
@@ -375,6 +431,11 @@ impl AudioPipeline {
         Ok(())
     }
 
+    /// Get the next scheduled play time (AudioContext seconds).
+    pub fn next_play_time(&self) -> f64 {
+        self.next_play_time
+    }
+
     /// Get the AudioContext's current time in milliseconds.
     pub fn current_time_ms(&self) -> f64 {
         self.audio_ctx
@@ -408,8 +469,9 @@ impl AudioPipeline {
         Ok(())
     }
 
-    /// Close the audio pipeline and release resources.
-    pub fn close(&mut self) {
+    /// Close just the audio decoder backend, keeping AudioContext + GainNode alive.
+    /// Use this during seek to preserve `currentTime` continuity.
+    pub fn close_decoder(&mut self) {
         match self.backend.take() {
             Some(AudioBackend::WebCodecs { decoder, data_queue, .. }) => {
                 let _ = decoder.close();
@@ -422,6 +484,12 @@ impl AudioPipeline {
             }
             None => {}
         }
+    }
+
+    /// Close the audio pipeline and release ALL resources (AudioContext included).
+    /// Use this only on full teardown (destroy, load new file).
+    pub fn close(&mut self) {
+        self.close_decoder();
         self.gain_node.take();
         if let Some(ctx) = self.audio_ctx.take() {
             let _ = ctx.close();

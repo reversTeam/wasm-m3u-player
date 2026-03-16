@@ -13,11 +13,29 @@ use crate::types::*;
 ///
 /// The limit is stored in a shared `Rc<Cell<u64>>` so the caller can change it
 /// after `Mp4Reader::read_header()` has taken ownership of the cursor.
+///
+/// ## Virtual offset (Range seek support)
+///
+/// For Range-based seeking, the physical buffer layout is:
+///   `[header (ftyp + mdat_header_empty + moov)] [range_data]`
+///
+/// The mp4 crate reads stco/co64 absolute file offsets (e.g., 800MB).
+/// The `virtual_base` field maps these to physical positions:
+///   seek(800MB) → physical = header_end + (800MB - virtual_base)
+///
+/// During header parsing (positions 0..header_end), seeks work normally.
+/// During sample reads (positions >= virtual_base), seeks are remapped.
 pub struct LimitedCursor {
     inner: Cursor<Vec<u8>>,
     /// Shared read limit. Reads at positions >= this value return EOF.
     /// u64::MAX means unlimited (used during header parsing).
     limit: Rc<Cell<u64>>,
+    /// File offset where range_data starts in the original file.
+    /// 0 = disabled (normal linear mode). > 0 = virtual offset mode.
+    virtual_base: u64,
+    /// Physical byte offset in the buffer where range_data begins.
+    /// Only used when virtual_base > 0.
+    header_end: u64,
 }
 
 impl LimitedCursor {
@@ -26,6 +44,27 @@ impl LimitedCursor {
         let cursor = LimitedCursor {
             inner: Cursor::new(data),
             limit: limit.clone(),
+            virtual_base: 0,
+            header_end: 0,
+        };
+        (cursor, limit)
+    }
+
+    /// Create a cursor with virtual offset support for Range-seeked MP4 data.
+    ///
+    /// Buffer layout: `[header_data (ftyp+mdat_hdr+moov)][range_data]`
+    /// - `virtual_base`: file offset where `range_data` starts in the original file
+    /// - `header_end`: physical position in buffer where `range_data` begins
+    ///
+    /// When the mp4 crate seeks to an absolute stco offset >= `virtual_base`,
+    /// the cursor remaps it to: `header_end + (offset - virtual_base)`.
+    fn new_with_offset(data: Vec<u8>, virtual_base: u64, header_end: u64) -> (Self, Rc<Cell<u64>>) {
+        let limit = Rc::new(Cell::new(u64::MAX));
+        let cursor = LimitedCursor {
+            inner: Cursor::new(data),
+            limit: limit.clone(),
+            virtual_base,
+            header_end,
         };
         (cursor, limit)
     }
@@ -47,7 +86,14 @@ impl Read for LimitedCursor {
 
 impl Seek for LimitedCursor {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.inner.seek(pos)
+        match pos {
+            SeekFrom::Start(offset) if self.virtual_base > 0 && offset >= self.virtual_base => {
+                // Remap: absolute file offset → physical position in range_data region
+                let physical = self.header_end + (offset - self.virtual_base);
+                self.inner.seek(SeekFrom::Start(physical))
+            }
+            _ => self.inner.seek(pos),
+        }
     }
 }
 
@@ -116,6 +162,117 @@ impl Mp4Demuxer {
         if let Some(ref handle) = self.read_limit {
             handle.set(limit);
         }
+    }
+
+    /// Parse an MP4 header from a Range-seeked buffer with virtual offset.
+    ///
+    /// Buffer layout: `[header_data (ftyp + mdat_header_empty + moov)][range_data]`
+    ///
+    /// - `virtual_base`: file offset where `range_data` starts in the original file
+    /// - `header_end`: physical byte in the buffer where `range_data` begins
+    ///
+    /// The cursor remaps stco/co64 absolute offsets ≥ `virtual_base` to physical
+    /// positions within the range_data region of the buffer.
+    ///
+    /// After parsing, `set_data_limit(header_end + range_data.len())` is set
+    /// automatically to prevent reads past the range data.
+    pub fn parse_header_range(
+        &mut self,
+        data: Vec<u8>,
+        virtual_base: u64,
+        header_end: u64,
+    ) -> Result<MediaInfo, DemuxError> {
+        let data_limit = data.len() as u64;
+        // Tell the mp4 crate the "file size" is only the header region.
+        // This prevents it from scanning range_data bytes as top-level boxes
+        // (which would cause "box with a larger size than it" errors).
+        // Sample reads still work because seek() remaps positions into range_data.
+        let size = header_end;
+        let (cursor, limit_handle) = LimitedCursor::new_with_offset(data, virtual_base, header_end);
+
+        let reader = mp4::Mp4Reader::read_header(cursor, size)
+            .map_err(|e| DemuxError::InvalidData(format!("MP4 Range parse error: {}", e)))?;
+
+        // Set data limit to prevent reading past range_data into moov
+        // (moov is in the header region, but stco seeks go to range_data region)
+        limit_handle.set(data_limit);
+        self.read_limit = Some(limit_handle);
+
+        let mut video_tracks = Vec::new();
+        let mut audio_tracks = Vec::new();
+        let mut sample_cursors = Vec::new();
+
+        for track_id in reader.tracks().keys().copied().collect::<Vec<_>>() {
+            let track = reader.tracks().get(&track_id).unwrap();
+
+            match track.track_type() {
+                Ok(mp4::TrackType::Video) => {
+                    let codec_string = Self::build_video_codec_string(track);
+                    let codec_config = Self::extract_video_codec_config(track);
+
+                    let fps = if track.duration().as_secs_f64() > 0.0 {
+                        Some(track.sample_count() as f64 / track.duration().as_secs_f64())
+                    } else {
+                        None
+                    };
+
+                    video_tracks.push(VideoTrackInfo {
+                        track_id,
+                        codec_string,
+                        width: track.width() as u32,
+                        height: track.height() as u32,
+                        fps,
+                        codec_config,
+                    });
+                    sample_cursors.push((track_id, 1));
+                }
+                Ok(mp4::TrackType::Audio) => {
+                    let codec_string = Self::build_audio_codec_string(track);
+                    let codec_config = Self::extract_audio_codec_config(track);
+
+                    let channel_count = track
+                        .channel_config()
+                        .map(|c| match c {
+                            mp4::ChannelConfig::Mono => 1u32,
+                            mp4::ChannelConfig::Stereo => 2,
+                            mp4::ChannelConfig::Three => 3,
+                            mp4::ChannelConfig::Four => 4,
+                            mp4::ChannelConfig::Five => 5,
+                            mp4::ChannelConfig::FiveOne => 6,
+                            mp4::ChannelConfig::SevenOne => 8,
+                        })
+                        .unwrap_or(2);
+
+                    audio_tracks.push(AudioTrackInfo {
+                        track_id,
+                        codec_string,
+                        sample_rate: track
+                            .sample_freq_index()
+                            .map(|s| s.freq() as u32)
+                            .unwrap_or(44100),
+                        channels: channel_count,
+                        codec_config,
+                    });
+                    sample_cursors.push((track_id, 1));
+                }
+                _ => {}
+            }
+        }
+
+        let duration_us = reader.duration().as_micros().try_into().ok();
+
+        let info = MediaInfo {
+            container: ContainerFormat::Mp4,
+            duration_us,
+            video_tracks,
+            audio_tracks,
+        };
+
+        self.media_info = Some(info.clone());
+        self.sample_cursors = sample_cursors;
+        self.reader = Some(reader);
+
+        Ok(info)
     }
 
     /// Scan top-level MP4 boxes from raw data without parsing their content.
