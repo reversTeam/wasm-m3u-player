@@ -218,9 +218,9 @@ export class PlayerControls {
 
         // Click on overlay (not on controls) → toggle play/pause
         this._overlay.addEventListener('click', (e) => {
-            if (e.target === this._overlay || e.target === this._gradient) {
-                this._trigger(this._playing ? 'pause' : 'play');
-            }
+            // Ignore clicks on interactive controls (buttons, sliders, bottom bar)
+            if (this._bottomBar.contains(e.target)) return;
+            this._trigger(this._playing ? 'pause' : 'play');
         });
 
         // Keyboard shortcuts (on container to capture when focused)
