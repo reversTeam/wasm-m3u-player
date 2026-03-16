@@ -12,12 +12,14 @@ const mediaInfoPanel = document.getElementById('media-info');
 const mediaInfoList = document.getElementById('media-info-list');
 const playlistPanel = document.getElementById('playlist-panel');
 const playlistList = document.getElementById('playlist-list');
+const fileInput = document.getElementById('file-input');
 
 let player = null;
 let controls = null;
 let rafId = null;
 let currentStatus = 'Idle';
 let totalFileBytes = 0;
+let currentObjectUrl = null;
 
 // --- Helpers ---
 function formatTime(ms) {
@@ -291,13 +293,19 @@ function setupControls() {
 }
 
 // --- Load Media ---
-async function loadMedia() {
-    const url = urlInput.value.trim();
+async function loadMedia(urlOverride) {
+    const url = urlOverride || urlInput.value.trim();
     if (!url) return;
 
     hideError();
     stopRenderLoop();
     totalFileBytes = 0;
+
+    // Revoke previous Object URL to free memory
+    if (currentObjectUrl) {
+        URL.revokeObjectURL(currentObjectUrl);
+        currentObjectUrl = null;
+    }
 
     if (player) {
         player.destroy();
@@ -333,9 +341,35 @@ async function loadMedia() {
 }
 
 // --- Bind Events ---
-loadBtn.addEventListener('click', loadMedia);
+loadBtn.addEventListener('click', () => loadMedia());
 urlInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') loadMedia();
+});
+
+fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    currentObjectUrl = URL.createObjectURL(file);
+    urlInput.value = file.name;
+    loadMedia(currentObjectUrl);
+    fileInput.value = ''; // reset so same file can be re-selected
+});
+
+// Drag & drop on player container
+container.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    container.classList.add('drag-over');
+});
+container.addEventListener('dragleave', () => container.classList.remove('drag-over'));
+container.addEventListener('drop', (e) => {
+    e.preventDefault();
+    container.classList.remove('drag-over');
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+    currentObjectUrl = URL.createObjectURL(file);
+    urlInput.value = file.name;
+    loadMedia(currentObjectUrl);
 });
 
 // --- Init WASM ---
