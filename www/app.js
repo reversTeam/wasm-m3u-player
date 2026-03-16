@@ -1,29 +1,22 @@
 import init, { Player } from './pkg/player.js';
+import { PlayerControls } from './player-controls.js';
 
 // --- DOM Elements ---
 const urlInput = document.getElementById('url-input');
 const loadBtn = document.getElementById('load-btn');
-const playBtn = document.getElementById('play-btn');
-const pauseBtn = document.getElementById('pause-btn');
-const stopBtn = document.getElementById('stop-btn');
-const seekBar = document.getElementById('seek-bar');
-const timeCurrent = document.getElementById('time-current');
-const timeDuration = document.getElementById('time-duration');
 const statusBar = document.getElementById('status-bar');
 const errorDisplay = document.getElementById('error-display');
 const canvas = document.getElementById('video-canvas');
-const overlay = document.getElementById('overlay');
-const overlayText = document.getElementById('overlay-text');
+const container = document.getElementById('player-container');
 const mediaInfoPanel = document.getElementById('media-info');
 const mediaInfoList = document.getElementById('media-info-list');
 const playlistPanel = document.getElementById('playlist-panel');
 const playlistList = document.getElementById('playlist-list');
-const downloadBar = document.getElementById('download-bar');
 
 let player = null;
-let rafId = null; // requestAnimationFrame handle
-let currentStatus = 'Idle'; // Track player status to avoid overlay conflicts
-let mediaDurationMs = 0; // Cached duration — avoids calling get_state() inside render_tick callbacks
+let controls = null;
+let rafId = null;
+let currentStatus = 'Idle';
 
 // --- Helpers ---
 function formatTime(ms) {
@@ -45,22 +38,6 @@ function showError(msg) {
 
 function hideError() {
     errorDisplay.classList.add('hidden');
-}
-
-function showOverlay(text) {
-    overlayText.textContent = text;
-    overlay.classList.remove('hidden');
-}
-
-function hideOverlay() {
-    overlay.classList.add('hidden');
-}
-
-function setControlsEnabled(play, pause, stop, seek) {
-    playBtn.disabled = !play;
-    pauseBtn.disabled = !pause;
-    stopBtn.disabled = !stop;
-    seekBar.disabled = !seek;
 }
 
 function displayMediaInfo(info) {
@@ -96,7 +73,6 @@ function startRenderLoop() {
             }
         } catch (e) {
             console.error('[render_tick] Exception caught — restarting loop:', e);
-            // Don't let the render loop die on transient errors
             rafId = requestAnimationFrame(tick);
         }
     }
@@ -110,7 +86,7 @@ function stopRenderLoop() {
     }
 }
 
-// --- Event Handler ---
+// --- Player Event Handler ---
 function handlePlayerEvent(event) {
     if (!event || !event.type) return;
 
@@ -118,40 +94,33 @@ function handlePlayerEvent(event) {
         case 'StatusChanged':
             currentStatus = event.status;
             setStatus(event.status);
+            if (controls) controls.updateStatus(event.status);
+
             switch (event.status) {
                 case 'Loading':
-                    showOverlay('Loading...');
-                    setControlsEnabled(false, false, false, false);
+                    if (controls) controls.showMessage('Loading...');
                     break;
                 case 'Ready':
-                    hideOverlay();
-                    setControlsEnabled(true, false, true, true);
+                    if (controls) controls.hideMessage();
                     break;
                 case 'Playing':
-                    hideOverlay();
-                    setControlsEnabled(false, true, true, true);
+                    if (controls) controls.hideMessage();
                     break;
                 case 'Paused':
                     stopRenderLoop();
-                    setControlsEnabled(true, false, true, true);
                     break;
                 case 'Buffering':
-                    showOverlay('Buffering...');
-                    setControlsEnabled(false, true, true, true);
+                    if (controls) controls.showMessage('Buffering...');
                     break;
                 case 'Seeking':
-                    showOverlay('Seeking...');
+                    if (controls) controls.showMessage('Seeking...');
                     break;
                 case 'Stopped':
                     stopRenderLoop();
-                    setControlsEnabled(true, false, false, false);
-                    timeCurrent.textContent = '0:00';
-                    seekBar.value = 0;
                     break;
                 case 'Error':
                     stopRenderLoop();
-                    hideOverlay();
-                    setControlsEnabled(false, false, true, false);
+                    if (controls) controls.hideMessage();
                     break;
             }
             break;
@@ -159,43 +128,31 @@ function handlePlayerEvent(event) {
         case 'MediaLoaded':
             if (event.info) {
                 displayMediaInfo(event.info);
-                if (event.info.duration_ms) {
-                    mediaDurationMs = event.info.duration_ms;
-                    timeDuration.textContent = formatTime(mediaDurationMs);
+                if (event.info.duration_ms && controls) {
+                    controls.updateDuration(event.info.duration_ms);
                 }
             }
             break;
 
         case 'TimeUpdate':
-            if (event.current_ms != null) {
-                timeCurrent.textContent = formatTime(event.current_ms);
-                // Use cached duration — calling get_state() here would cause a
-                // RefCell double-borrow panic because we're inside render_tick's &mut self.
-                if (mediaDurationMs > 0) {
-                    seekBar.value = Math.round((event.current_ms / mediaDurationMs) * 1000);
-                }
+            if (event.current_ms != null && controls) {
+                controls.updateTime(event.current_ms);
             }
             break;
 
         case 'DownloadProgress': {
             const received = event.received_bytes;
             const total = event.total_bytes;
-            // Only show overlay during initial loading (before header is parsed).
-            // Once status moves to Ready/Playing/etc, show progress in status bar only.
-            if (currentStatus === 'Loading') {
+            if (currentStatus === 'Loading' && controls) {
                 if (total > 0) {
                     const pct = Math.round((received / total) * 100);
                     const mb = (received / 1048576).toFixed(1);
                     const totalMb = (total / 1048576).toFixed(1);
-                    showOverlay(`Loading... ${pct}% (${mb} / ${totalMb} MB)`);
+                    controls.showMessage(`Loading... ${pct}% (${mb} / ${totalMb} MB)`);
                 } else {
                     const mb = (received / 1048576).toFixed(1);
-                    showOverlay(`Loading... ${mb} MB`);
+                    controls.showMessage(`Loading... ${mb} MB`);
                 }
-            }
-            // Always update the download bar if it exists
-            if (downloadBar && total > 0) {
-                downloadBar.style.width = `${Math.round((received / total) * 100)}%`;
             }
             break;
         }
@@ -213,14 +170,11 @@ function handlePlayerEvent(event) {
             break;
 
         case 'Seeking':
-            showOverlay(`Seeking to ${formatTime(event.target_ms)}...`);
+            if (controls) controls.showMessage(`Seeking to ${formatTime(event.target_ms)}...`);
             break;
 
         case 'Seeked':
-            hideOverlay();
-            if (event.actual_ms != null) {
-                timeCurrent.textContent = formatTime(event.actual_ms);
-            }
+            if (controls) controls.hideMessage();
             break;
 
         case 'BufferUpdate':
@@ -229,7 +183,7 @@ function handlePlayerEvent(event) {
         case 'Ended':
             stopRenderLoop();
             setStatus('Ended');
-            setControlsEnabled(true, false, false, false);
+            if (controls) controls.updateStatus('Ended');
             break;
 
         default:
@@ -273,7 +227,6 @@ async function playTrack(index) {
     try {
         stopRenderLoop();
         await player.play_track(index);
-        // Auto-play after track load
         await player.play();
         startRenderLoop();
     } catch (e) {
@@ -281,7 +234,46 @@ async function playTrack(index) {
     }
 }
 
-// --- Actions ---
+// --- Setup Controls ---
+function setupControls() {
+    if (controls) controls.destroy();
+
+    controls = new PlayerControls(container);
+
+    controls.on('play', async () => {
+        if (!player) return;
+        try {
+            await player.play();
+            startRenderLoop();
+        } catch (e) {
+            showError(`Play failed: ${e}`);
+        }
+    });
+
+    controls.on('pause', async () => {
+        if (!player) return;
+        await player.pause();
+    });
+
+    controls.on('seek', async ({ targetMs }) => {
+        if (!player) return;
+        try {
+            await player.seek(BigInt(targetMs));
+            if (currentStatus === 'Playing' || currentStatus === 'Buffering') {
+                startRenderLoop();
+            }
+        } catch (e) {
+            showError(`Seek failed: ${e}`);
+        }
+    });
+
+    controls.on('volumechange', ({ volume, muted }) => {
+        // Volume is handled JS-side for now (WebAudio gain or future API)
+        console.log(`Volume: ${volume}, Muted: ${muted}`);
+    });
+}
+
+// --- Load Media ---
 async function loadMedia() {
     const url = urlInput.value.trim();
     if (!url) return;
@@ -289,7 +281,6 @@ async function loadMedia() {
     hideError();
     stopRenderLoop();
 
-    // Destroy previous player if any
     if (player) {
         player.destroy();
     }
@@ -297,9 +288,11 @@ async function loadMedia() {
     try {
         player = new Player(canvas);
         player.on_event(handlePlayerEvent);
+        setupControls();
+
         currentStatus = 'Loading';
         setStatus('Loading...');
-        showOverlay('Loading...');
+        controls.showMessage('Loading...');
 
         if (isM3uUrl(url)) {
             await player.load_playlist(url);
@@ -310,74 +303,20 @@ async function loadMedia() {
             await player.load(url);
         }
 
-        // Auto-play: start playback immediately after load
         await player.play();
         startRenderLoop();
     } catch (e) {
         showError(`Load failed: ${e}`);
         setStatus('Error');
-        hideOverlay();
+        if (controls) controls.hideMessage();
     }
 }
-
-async function play() {
-    if (!player) return;
-    try {
-        await player.play();
-        startRenderLoop();
-    } catch (e) {
-        showError(`Play failed: ${e}`);
-    }
-}
-
-async function pause() {
-    if (!player) return;
-    await player.pause();
-    // render loop is stopped in the event handler
-}
-
-function stop() {
-    if (!player) return;
-    stopRenderLoop();
-    player.stop();
-}
-
-// --- Seek ---
-let isSeeking = false;
-
-seekBar.addEventListener('input', () => {
-    // While dragging, update the time display but don't seek yet
-    if (!player || mediaDurationMs <= 0) return;
-    const targetMs = Math.round((seekBar.value / 1000) * mediaDurationMs);
-    timeCurrent.textContent = formatTime(targetMs);
-});
-
-seekBar.addEventListener('change', async () => {
-    if (!player || isSeeking || mediaDurationMs <= 0) return;
-
-    const targetMs = Math.round((seekBar.value / 1000) * mediaDurationMs);
-    const wasPlaying = currentStatus === 'Playing' || currentStatus === 'Buffering';
-    isSeeking = true;
-    try {
-        await player.seek(BigInt(targetMs));
-        // Restart render loop if we were playing
-        if (wasPlaying) {
-            startRenderLoop();
-        }
-    } catch (e) {
-        showError(`Seek failed: ${e}`);
-    }
-    isSeeking = false;
-});
 
 // --- Bind Events ---
 loadBtn.addEventListener('click', loadMedia);
 urlInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') loadMedia();
 });
-playBtn.addEventListener('click', play);
-pauseBtn.addEventListener('click', pause);
-stopBtn.addEventListener('click', stop);
 
 // --- Init WASM ---
 async function main() {

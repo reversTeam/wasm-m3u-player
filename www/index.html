@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WASM Video Player — Test Page</title>
+    <title>WASM Video Player</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -15,24 +15,9 @@
             <button id="load-btn">Load</button>
         </div>
 
-        <div class="player-container">
+        <div class="player-container" id="player-container">
             <canvas id="video-canvas" width="640" height="360"></canvas>
-            <div id="overlay" class="overlay hidden">
-                <span id="overlay-text"></span>
-            </div>
-        </div>
-
-        <div class="controls">
-            <div class="controls-row">
-                <button id="play-btn" disabled title="Play">&#9654;</button>
-                <button id="pause-btn" disabled title="Pause">&#9646;&#9646;</button>
-                <button id="stop-btn" disabled title="Stop">&#9632;</button>
-            </div>
-            <div class="timeline">
-                <span id="time-current">0:00</span>
-                <input type="range" id="seek-bar" min="0" max="1000" value="0" step="1" disabled />
-                <span id="time-duration">0:00</span>
-            </div>
+            <!-- PlayerControls overlay is injected here dynamically -->
         </div>
 
         <div id="status-bar">Status: Idle</div>
