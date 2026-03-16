@@ -1144,12 +1144,14 @@ impl Player {
             // Resume from pause: adjust clock so it continues from current_time_ms.
             // Use master_now_ms() (audio clock when available) for drift-free sync.
             self.playback_start_time = self.master_now_ms() - self.state.current_time_ms as f64;
-            // Reset audio schedule so new buffers are scheduled from AudioContext's
-            // current time (which was frozen during suspend)
+            // DON'T reset_schedule() here — suspend/resume preserves all
+            // already-scheduled AudioBufferSourceNodes. Destroying the GainNode
+            // would kill in-flight audio and cause a ~200ms gap until new buffers
+            // get demuxed → decoded → scheduled.
+            // Just clear the PTS-based origin so new buffers use sequential scheduling
+            // from where the pipeline left off.
             if self.audio_pipeline.is_configured() {
-                self.audio_pipeline.reset_schedule();
-                self.audio_pipeline
-                    .set_schedule_origin(self.state.current_time_ms as f64 / 1000.0);
+                self.audio_pipeline.clear_schedule_origin();
             }
         } else {
             // Fresh start from Ready state

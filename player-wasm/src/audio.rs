@@ -271,6 +271,13 @@ impl AudioPipeline {
         }
     }
 
+    /// Clear PTS-based scheduling origin — revert to sequential scheduling.
+    /// Used on pause→play resume: already-scheduled buffers keep playing,
+    /// new buffers are appended sequentially after them.
+    pub fn clear_schedule_origin(&mut self) {
+        self.schedule_origin = None;
+    }
+
     /// Reset the audio scheduling time to the current AudioContext time.
     /// Also disconnects the old GainNode and creates a fresh one, which
     /// silences any previously-scheduled AudioBufferSourceNodes still playing.
