@@ -60,8 +60,8 @@ fn parse_ebml_vint(data: &[u8]) -> Option<(u64, usize)> {
 
     // Strip the VINT_MARKER bit and read the value
     let mut value = (first & (0xFF >> width)) as u64;
-    for i in 1..width {
-        value = (value << 8) | data[i] as u64;
+    for &byte in data.iter().take(width).skip(1) {
+        value = (value << 8) | byte as u64;
     }
 
     Some((value, width))
@@ -126,6 +126,12 @@ pub struct MkvDemuxer {
     /// Stored as `Bytes` so that cloning (e.g. in seek_to_keyframe) is O(1)
     /// via atomic refcount instead of a full buffer copy.
     raw_data: Option<Bytes>,
+}
+
+impl Default for MkvDemuxer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MkvDemuxer {
@@ -439,8 +445,8 @@ impl MkvDemuxer {
         // Strip the leading marker bit
         let mask = first & !(0x80u8 >> (len - 1));
         let mut value = mask as u64;
-        for j in 1..len {
-            value = (value << 8) | data[j] as u64;
+        for &byte in data.iter().take(len).skip(1) {
+            value = (value << 8) | byte as u64;
         }
 
         (len, value)

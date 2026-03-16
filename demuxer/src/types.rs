@@ -89,7 +89,7 @@ pub struct SeekEntry {
 /// - MKV: Cues element (native seek index)
 ///
 /// Entries are sorted by timestamp_us ascending.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SeekIndex {
     pub entries: Vec<SeekEntry>,
 }

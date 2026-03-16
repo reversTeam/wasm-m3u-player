@@ -140,6 +140,12 @@ pub enum MoovLocation {
     Unknown,
 }
 
+impl Default for Mp4Demuxer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Mp4Demuxer {
     pub fn new() -> Self {
         Self {
@@ -248,7 +254,7 @@ impl Mp4Demuxer {
                         codec_string,
                         sample_rate: track
                             .sample_freq_index()
-                            .map(|s| s.freq() as u32)
+                            .map(|s| s.freq())
                             .unwrap_or(44100),
                         channels: channel_count,
                         codec_config,
@@ -413,14 +419,14 @@ impl Mp4Demuxer {
     fn extract_video_codec_config(mp4_track: &mp4::Mp4Track) -> Vec<u8> {
         if let Some(avc1) = mp4_track.trak.mdia.minf.stbl.stsd.avc1.as_ref() {
             let avcc = &avc1.avcc;
-            let mut config = Vec::new();
-
-            // AVCDecoderConfigurationRecord header
-            config.push(avcc.configuration_version);
-            config.push(avcc.avc_profile_indication);
-            config.push(avcc.profile_compatibility);
-            config.push(avcc.avc_level_indication);
-            config.push(avcc.length_size_minus_one | 0xFC); // upper 6 bits reserved = 1
+            let mut config = vec![
+                // AVCDecoderConfigurationRecord header
+                avcc.configuration_version,
+                avcc.avc_profile_indication,
+                avcc.profile_compatibility,
+                avcc.avc_level_indication,
+                avcc.length_size_minus_one | 0xFC, // upper 6 bits reserved = 1
+            ];
 
             // SPS array
             config.push(avcc.sequence_parameter_sets.len() as u8 | 0xE0); // upper 3 bits reserved = 1
@@ -672,7 +678,7 @@ impl Demuxer for Mp4Demuxer {
                         codec_string,
                         sample_rate: track
                             .sample_freq_index()
-                            .map(|s| s.freq() as u32)
+                            .map(|s| s.freq())
                             .unwrap_or(44100),
                         channels: channel_count,
                         codec_config,
