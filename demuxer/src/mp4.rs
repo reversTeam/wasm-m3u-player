@@ -252,10 +252,7 @@ impl Mp4Demuxer {
                     audio_tracks.push(AudioTrackInfo {
                         track_id,
                         codec_string,
-                        sample_rate: track
-                            .sample_freq_index()
-                            .map(|s| s.freq())
-                            .unwrap_or(44100),
+                        sample_rate: track.sample_freq_index().map(|s| s.freq()).unwrap_or(44100),
                         channels: channel_count,
                         codec_config,
                     });
@@ -676,10 +673,7 @@ impl Demuxer for Mp4Demuxer {
                     audio_tracks.push(AudioTrackInfo {
                         track_id,
                         codec_string,
-                        sample_rate: track
-                            .sample_freq_index()
-                            .map(|s| s.freq())
-                            .unwrap_or(44100),
+                        sample_rate: track.sample_freq_index().map(|s| s.freq()).unwrap_or(44100),
                         channels: channel_count,
                         codec_config,
                     });

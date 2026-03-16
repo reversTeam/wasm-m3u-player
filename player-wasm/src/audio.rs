@@ -367,7 +367,7 @@ impl AudioPipeline {
             let float_array = js_sys::Float32Array::new(&js_buffer);
             let mut channel_data = vec![0f32; num_frames as usize];
             float_array.copy_to(&mut channel_data);
-            audio_buffer.copy_to_channel(&mut channel_data, ch as i32)?;
+            audio_buffer.copy_to_channel(&channel_data, ch as i32)?;
         }
 
         let source: AudioBufferSourceNode = ctx.create_buffer_source()?;
@@ -420,7 +420,7 @@ impl AudioPipeline {
 
         for ch in 0..nch as usize {
             let mut data = pcm.channels[ch].clone();
-            audio_buffer.copy_to_channel(&mut data, ch as i32)?;
+            audio_buffer.copy_to_channel(&data, ch as i32)?;
         }
 
         let source: AudioBufferSourceNode = ctx.create_buffer_source()?;

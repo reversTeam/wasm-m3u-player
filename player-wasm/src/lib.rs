@@ -1,3 +1,22 @@
+// WASM bindings produce many patterns that trigger clippy (JS interop casts,
+// RefCell across await in single-threaded WASM, format! in format!, etc.)
+#![allow(dead_code)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::useless_conversion)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::manual_map)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::format_in_format_args)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::await_holding_refcell_ref)]
+#![allow(clippy::unnecessary_to_owned)]
+#![allow(clippy::cast_lossless)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::double_ended_iterator_last)]
+#![allow(clippy::thread_local_initializer_can_be_made_const)]
+#![allow(clippy::empty_line_after_doc_comments)]
+
 use wasm_bindgen::prelude::*;
 
 pub mod audio;
