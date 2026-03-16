@@ -175,7 +175,9 @@ export class PlayerControls {
         this._seekBar.addEventListener('change', () => {
             if (this._durationMs <= 0) return;
             const targetMs = Math.round((this._seekBar.value / 1000) * this._durationMs);
-            this._seeking = false;
+            // Keep _seeking=true until the player confirms via seekComplete().
+            // This prevents TimeUpdate events from snapping the bar back to the
+            // old position while the async seek is in progress.
             this._trigger('seek', { targetMs });
         });
 
@@ -291,6 +293,12 @@ export class PlayerControls {
                 this._updateSeekVisuals(currentMs);
             }
         }
+    }
+
+    /** Signal that a seek operation completed — unlocks the seek bar.
+     *  Call this from the Seeked event handler. */
+    seekComplete() {
+        this._seeking = false;
     }
 
     /** Update total duration */

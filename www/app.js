@@ -189,7 +189,10 @@ function handlePlayerEvent(event) {
             break;
 
         case 'Seeked':
-            if (controls) controls.hideMessage();
+            if (controls) {
+                controls.hideMessage();
+                controls.seekComplete();
+            }
             break;
 
         case 'BufferUpdate':
@@ -284,6 +287,8 @@ function setupControls() {
             }
         } catch (e) {
             showError(`Seek failed: ${e}`);
+            // Unlock seek bar on failure so it doesn't stay stuck
+            if (controls) controls.seekComplete();
         }
     });
 
