@@ -92,13 +92,6 @@ impl AudioPipeline {
         // Check if this is an AC-3/E-AC-3 codec — use software decoder directly
         // (WebCodecs rejects these asynchronously, which causes silent failures)
         if codec == "ac-3" || codec == "ec-3" {
-            web_sys::console::log_1(
-                &format!(
-                    "[audio] Using software AC-3/E-AC-3 decoder for codec '{}'",
-                    codec
-                )
-                .into(),
-            );
             self.backend = Some(AudioBackend::Software {
                 decoder: ac3_decode::Ac3Decoder::new(),
                 sample_rate,
@@ -212,32 +205,8 @@ impl AudioPipeline {
                         });
                         Ok(())
                     }
-                    Err(e) => {
-                        // Log first few errors, then suppress to avoid flooding console
+                    Err(_e) => {
                         *error_count += 1;
-                        if *error_count <= 3 {
-                            let hex: String = chunk
-                                .data
-                                .iter()
-                                .take(12)
-                                .map(|b| format!("{:02x}", b))
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            web_sys::console::log_1(
-                                &format!(
-                                    "[audio-sw] decode error: {} (len={}, head={})",
-                                    e,
-                                    chunk.data.len(),
-                                    hex
-                                )
-                                .into(),
-                            );
-                            if *error_count == 3 {
-                                web_sys::console::log_1(
-                                    &"[audio-sw] suppressing further decode errors".into(),
-                                );
-                            }
-                        }
                         Ok(())
                     }
                 }
