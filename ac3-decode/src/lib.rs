@@ -509,7 +509,7 @@ impl Ac3Decoder {
         let bitrate = BIT_RATES[frmsizecod / 2] as usize;
         let frmsize = match fscod {
             0 => 2 * bitrate,
-            1 => ((320 * bitrate) / 147 + (frmsizecod & 1)),
+            1 => (320 * bitrate) / 147 + (frmsizecod & 1),
             2 => 3 * bitrate,
             _ => unreachable!(),
         } * 2; // words → bytes
@@ -591,6 +591,16 @@ impl Ac3Decoder {
         eac.frmsiz = br.read(11) as usize;
         eac.frmsize = (eac.frmsiz + 1) * 2;
 
+        // Reject dependent substreams early
+        if eac.strmtyp == 1 {
+            return Err(DecodeError::InvalidHeader("E-AC-3 dependent substream not supported".into()));
+        }
+
+        // Minimum frame size: must be large enough for at least the sync + header
+        if eac.frmsize < 8 {
+            return Err(DecodeError::InvalidHeader("E-AC-3 frame too small".into()));
+        }
+
         eac.fscod = br.read(2) as usize;
         if eac.fscod == 3 {
             // Reduced sample rate: read fscod2
@@ -602,13 +612,21 @@ impl Ac3Decoder {
             eac.numblkscod = 3; // forced to 6 blocks when fscod==3
         } else {
             eac.numblkscod = br.read(2) as u8;
-            if eac.fscod < 3 {
-                eac.sample_rate = SAMPLE_RATES[eac.fscod];
-            }
+            eac.sample_rate = SAMPLE_RATES[eac.fscod.min(2)];
         }
-        eac.num_blocks = EAC3_BLOCKS[eac.numblkscod as usize];
+        eac.num_blocks = EAC3_BLOCKS[(eac.numblkscod as usize).min(3)];
+
+        // Validate num_blocks
+        if !matches!(eac.num_blocks, 1 | 2 | 3 | 6) {
+            return Err(DecodeError::InvalidHeader(
+                format!("invalid num_blocks: {}", eac.num_blocks),
+            ));
+        }
 
         eac.acmod = br.read(3) as u8;
+        if eac.acmod > 7 {
+            return Err(DecodeError::InvalidHeader("invalid acmod".into()));
+        }
         eac.lfeon = br.read_bool();
         eac.bsid = br.read(5) as u8;
 
@@ -616,7 +634,12 @@ impl Ac3Decoder {
             return Err(DecodeError::UnsupportedVersion(eac.bsid));
         }
 
-        eac.nfchans = NFCHANS[eac.acmod as usize];
+        eac.nfchans = NFCHANS[(eac.acmod as usize).min(7)];
+        if eac.nfchans > MAX_CHANNELS {
+            return Err(DecodeError::InvalidHeader(
+                format!("nfchans {} exceeds MAX_CHANNELS {}", eac.nfchans, MAX_CHANNELS),
+            ));
+        }
 
         // ===== BSI metadata =====
         eac.dialnorm = br.read(5) as u8;
@@ -1062,7 +1085,7 @@ impl Ac3Decoder {
         for ch in 0..nfchans {
             if ab.chexpstr[ch] != 0 {
                 if !ab.chincpl[ch] {
-                    ab.chbwcod[ch] = br.read(6) as usize;
+                    ab.chbwcod[ch] = (br.read(6) as usize).min(60);
                 }
             }
         }
@@ -1088,9 +1111,9 @@ impl Ac3Decoder {
             if ab.chexpstr[ch] != 0 {
                 ab.strtmant[ch] = 0;
                 if ab.chincpl[ch] {
-                    ab.endmant[ch] = 37 + 12 * ab.cplbegf;
+                    ab.endmant[ch] = (37 + 12 * ab.cplbegf).min(253);
                 } else {
-                    ab.endmant[ch] = 37 + 3 * (ab.chbwcod[ch] + 12);
+                    ab.endmant[ch] = (37 + 3 * (ab.chbwcod[ch] + 12)).min(253);
                 }
 
                 let grpsize = EXPONENT_GROUP_SIZE[ab.chexpstr[ch] as usize];
@@ -1158,12 +1181,12 @@ impl Ac3Decoder {
             for ch in 0..nfchans { ab.deltbae[ch] = br.read(2) as u8; }
 
             if ab.cplinu && ab.cpldeltbae == 1 {
-                let nseg = br.read(3) as usize;
+                let _nseg = br.read(3) as usize;
                 // Note: cpldeltba not stored separately for simplicity
             }
             for ch in 0..nfchans {
                 if ab.deltbae[ch] == 1 {
-                    ab.deltnseg[ch] = br.read(3) as usize;
+                    ab.deltnseg[ch] = (br.read(3) as usize).min(7);
                     for seg in 0..=ab.deltnseg[ch] {
                         ab.deltoffst[ch][seg] = br.read(5) as usize;
                         ab.deltlen[ch][seg] = br.read(4) as usize;
@@ -1516,6 +1539,9 @@ impl Ac3Decoder {
             if eac_bsi.chexpstr[ch][blk] != 0 {
                 if !ab.chincpl[ch] {
                     ab.chbwcod[ch] = br.read(6) as usize;
+                    // Clamp so endmant = 37 + 3*(chbwcod+12) doesn't exceed 253
+                    // max chbwcod = 60 → endmant = 37+3*72 = 253
+                    ab.chbwcod[ch] = ab.chbwcod[ch].min(60);
                 }
             }
         }
@@ -1543,9 +1569,9 @@ impl Ac3Decoder {
             if expstr != 0 {
                 ab.strtmant[ch] = 0;
                 if ab.chincpl[ch] {
-                    ab.endmant[ch] = 37 + 12 * ab.cplbegf;
+                    ab.endmant[ch] = (37 + 12 * ab.cplbegf).min(253);
                 } else {
-                    ab.endmant[ch] = 37 + 3 * (ab.chbwcod[ch] + 12);
+                    ab.endmant[ch] = (37 + 3 * (ab.chbwcod[ch] + 12)).min(253);
                 }
 
                 let grpsize = EXPONENT_GROUP_SIZE[expstr as usize];
@@ -1596,8 +1622,8 @@ impl Ac3Decoder {
             }
             for ch in 0..nfchans.min(MAX_CHANNELS) {
                 if ab.deltbae[ch] == 1 {
-                    ab.deltnseg[ch] = br.read(3) as usize;
-                    for seg in 0..=ab.deltnseg[ch].min(7) {
+                    ab.deltnseg[ch] = (br.read(3) as usize).min(7);
+                    for seg in 0..=ab.deltnseg[ch] {
                         ab.deltoffst[ch][seg] = br.read(5) as usize;
                         ab.deltlen[ch][seg] = br.read(4) as usize;
                         ab.deltba[ch][seg] = br.read(3) as usize;
@@ -1829,7 +1855,7 @@ fn unpack_exponents(
     out[0] = absexp.clamp(0, 24) as u8;
 
     let mut idx = skip;
-    for (i, &exp_val) in dexps.iter().enumerate() {
+    for &exp_val in dexps.iter() {
         let clamped = exp_val.clamp(0, 24) as u8;
         for _ in 0..grpsize {
             if idx < 256 {
@@ -1998,7 +2024,7 @@ fn bit_allocation(
         if bndpsd[bin] < ba.dbknee {
             excite[bin] += (ba.dbknee - bndpsd[bin]) >> 2;
         }
-        mask[bin] = excite[bin].max(HTH[fscod][bin] as i32);
+        mask[bin] = excite[bin].max(HTH[fscod.min(2)][bin] as i32);
     }
 
     // Step 5: Delta bit allocation
@@ -2293,6 +2319,57 @@ mod tests {
         // This should parse BSI but fail with FrameTooShort since data is only 8 bytes
         // but frmsize = 3072
         let result = decoder.decode_frame(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn eac3_dependent_substream_rejected() {
+        let mut decoder = Ac3Decoder::new();
+        // strmtyp=1 (dependent) in header
+        let mut data = vec![0x0B, 0x77];
+        // byte 2-3: strmtyp=01, substreamid=000, frmsiz=10111111111
+        // 01 000 101 11111111 → 0x45 0xFF
+        data.extend_from_slice(&[0x45, 0xFF]);
+        // byte 4: fscod=00, numblkscod=11, acmod=111, lfeon=1 → 0x3F 0x85
+        data.extend_from_slice(&[0x3F, 0x85]);
+        // pad to at least 8 bytes
+        data.extend_from_slice(&[0x00; 4]);
+        let result = decoder.decode_frame(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn eac3_invalid_fscod_rejected() {
+        let mut decoder = Ac3Decoder::new();
+        // fscod=11 (invalid without fscod2)
+        // byte 2-3: strmtyp=00, substreamid=000, frmsiz=10111111111
+        // 00 000 101 11111111 → 0x05 0xFF
+        // byte 4: fscod=11, ... → 0xFF ...
+        let data = vec![0x0B, 0x77, 0x05, 0xFF, 0xFF, 0x85, 0x00, 0x00, 0x00, 0x00];
+        let result = decoder.decode_frame(&data);
+        // Should either handle reduced rate or error gracefully
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn eac3_zero_length_frame() {
+        let mut decoder = Ac3Decoder::new();
+        // frmsiz=0 → frmsize=2, way too small for a valid frame
+        let data = vec![0x0B, 0x77, 0x00, 0x00, 0x3F, 0x85, 0x00, 0x00];
+        let result = decoder.decode_frame(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ac3_decoder_reset() {
+        let mut decoder = Ac3Decoder::new();
+        decoder.reset();
+        // Should be safe to call reset multiple times
+        decoder.reset();
+        // After reset, decoding should work normally
+        let data = vec![0x0B, 0x77, 0x05, 0xFF, 0x3F, 0x85, 0x00, 0x00];
+        let result = decoder.decode_frame(&data);
+        // Will fail (frame too short) but shouldn't panic
         assert!(result.is_err());
     }
 }
