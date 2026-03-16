@@ -311,7 +311,7 @@ export class PlayerControls {
     /** Update buffered amount (in ms or bytes — used for buffer bar) */
     updateBuffered(bufferedMs) {
         this._bufferedMs = bufferedMs;
-        this._updateSeekVisuals(this._currentMs);
+        this._updateBufferedVisual();
     }
 
     /** Update playback status */
@@ -438,11 +438,17 @@ export class PlayerControls {
     _updateSeekVisuals(currentMs) {
         if (this._durationMs <= 0) return;
         const playedPct = Math.min((currentMs / this._durationMs) * 100, 100);
-        const bufferedPct = Math.min((this._bufferedMs / this._durationMs) * 100, 100);
 
         this._seekPlayed.style.width = `${playedPct}%`;
-        this._seekBuffered.style.width = `${bufferedPct}%`;
         this._seekThumb.style.left = `${playedPct}%`;
+        this._updateBufferedVisual();
+    }
+
+    /** Update only the buffered bar — safe to call during seek */
+    _updateBufferedVisual() {
+        if (this._durationMs <= 0) return;
+        const bufferedPct = Math.min((this._bufferedMs / this._durationMs) * 100, 100);
+        this._seekBuffered.style.width = `${bufferedPct}%`;
     }
 
     _setVolume(vol) {

@@ -2844,23 +2844,30 @@ impl Player {
 
         match format {
             ContainerFormat::Mp4 => {
-                let data = self.build_demux_buffer();
-                let download_len = self.download.borrow().data.len();
-                let mut demuxer = Mp4Demuxer::new();
-                demuxer.parse_header(&data).map_err(|e| {
-                    JsValue::from_str(&format!("Seek: MP4 parse error: {}", e))
-                })?;
-                // Limit reads to actual data (see try_demux_more for explanation)
-                if self.moov_data.is_some() {
-                    demuxer.set_data_limit(download_len as u64);
+                // Reuse cached MP4 demuxer if available — avoids cloning the
+                // entire download buffer (which can OOM on large files in WASM).
+                // The cached demuxer already has the parsed moov/header.
+                if let Some(ref mut demuxer) = self.mp4_demuxer {
+                    demuxer.seek_to_keyframe(timestamp_us).map_err(|e| {
+                        JsValue::from_str(&format!("Seek error (cached): {}", e))
+                    })?;
+                    self.mp4_cursors = Some(demuxer.sample_positions());
+                } else {
+                    let data = self.build_demux_buffer();
+                    let download_len = self.download.borrow().data.len();
+                    let mut demuxer = Mp4Demuxer::new();
+                    demuxer.parse_header(&data).map_err(|e| {
+                        JsValue::from_str(&format!("Seek: MP4 parse error: {}", e))
+                    })?;
+                    if self.moov_data.is_some() {
+                        demuxer.set_data_limit(download_len as u64);
+                    }
+                    demuxer.seek_to_keyframe(timestamp_us).map_err(|e| {
+                        JsValue::from_str(&format!("Seek error: {}", e))
+                    })?;
+                    self.mp4_cursors = Some(demuxer.sample_positions());
+                    self.mp4_demuxer = Some(demuxer);
                 }
-
-                demuxer.seek_to_keyframe(timestamp_us).map_err(|e| {
-                    JsValue::from_str(&format!("Seek error: {}", e))
-                })?;
-
-                // Save the new cursor positions for try_demux_more
-                self.mp4_cursors = Some(demuxer.sample_positions());
             }
             ContainerFormat::Mkv | ContainerFormat::WebM => {
                 let data = self.build_mkv_buffer();
