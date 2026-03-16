@@ -2136,10 +2136,13 @@ impl Player {
         self.av_sync.resync_timer(now_ms());
         self.clock_synced_to_first_frame = false;
         self.skip_frames_before_us = None;
-        // Discard audio chunks with PTS before the video keyframe.
-        // After seek, the demuxer positions audio earlier than video (audio samples
-        // are more granular). Without this filter, audio plays ~50-200ms ahead.
-        self.audio_skip_before_us = Some(actual_ms * 1000.0); // ms → µs
+        // PTS-based scheduling (set_schedule_origin at Buffering→Playing) handles
+        // audio/video alignment: audio buffers are scheduled based on their PTS
+        // relative to the first decoded video frame. Audio >50ms before the origin
+        // is auto-skipped in schedule_audio_data(). No need for audio_skip_before_us
+        // which was causing multi-second silence gaps (it used the requested time,
+        // not the actual keyframe PTS, dropping all audio between keyframe and target).
+        self.audio_skip_before_us = None;
         if self.audio_pipeline.is_configured() {
             self.audio_pipeline.reset_schedule();
             // Set PTS-based scheduling origin: at this AudioContext moment,
