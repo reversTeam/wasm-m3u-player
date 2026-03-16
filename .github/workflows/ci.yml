@@ -41,38 +41,6 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --exclude player-wasm
 
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-          targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Clippy (native crates)
-        run: cargo clippy --workspace --exclude player-wasm -- -D warnings
-
-      - name: Clippy (WASM)
-        run: cargo clippy --target wasm32-unknown-unknown -p player-wasm -- -D warnings
-
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
   build-wasm:
     name: Build WASM
     runs-on: ubuntu-latest

@@ -419,7 +419,7 @@ impl AudioPipeline {
         let audio_buffer = ctx.create_buffer(nch, num_frames, pcm.sample_rate)?;
 
         for ch in 0..nch as usize {
-            let mut data = pcm.channels[ch].clone();
+            let data = pcm.channels[ch].clone();
             audio_buffer.copy_to_channel(&data, ch as i32)?;
         }
 

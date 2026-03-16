@@ -14,8 +14,9 @@
 #![allow(clippy::cast_lossless)]
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::double_ended_iterator_last)]
-#![allow(clippy::thread_local_initializer_can_be_made_const)]
+#![allow(clippy::missing_const_for_thread_local)]
 #![allow(clippy::empty_line_after_doc_comments)]
+#![allow(clippy::doc_lazy_continuation)]
 
 use wasm_bindgen::prelude::*;
 
