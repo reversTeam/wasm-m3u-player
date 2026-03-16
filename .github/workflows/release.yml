@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set package version
+        run: |
+          # Update Cargo.toml version
+          sed -i "s/^version = \".*\"/version = \"${{ steps.version.outputs.VERSION }}\"/" player-wasm/Cargo.toml
+
+      - name: Build WASM package
+        run: wasm-pack build player-wasm/ --target web --out-dir ../www/pkg --out-name player
+
+      - name: Verify output
+        run: |
+          test -f www/pkg/player.js
+          test -f www/pkg/player_bg.wasm
+          test -f www/pkg/player.d.ts
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-pkg
+          path: www/pkg/
+
+  publish-npm:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg
+          path: npm-pkg/
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare npm package
+        run: |
+          # Copy README into the package
+          cp README.md npm-pkg/
+
+          # Write the final package.json with correct version and metadata
+          cat > npm-pkg/package.json << 'PKGJSON'
+          {
+            "name": "wasm-m3u-player",
+            "version": "${{ steps.version.outputs.VERSION }}",
+            "description": "High-performance headless video player built with Rust/WASM. Hardware-accelerated decoding via WebCodecs, renders to canvas. Supports MP4, MKV, WebM with AC-3/E-AC-3 software decoding.",
+            "type": "module",
+            "main": "player.js",
+            "types": "player.d.ts",
+            "files": [
+              "player.js",
+              "player.d.ts",
+              "player_bg.wasm",
+              "player_bg.wasm.d.ts",
+              "README.md"
+            ],
+            "keywords": [
+              "video",
+              "player",
+              "wasm",
+              "webassembly",
+              "webcodecs",
+              "mp4",
+              "mkv",
+              "webm",
+              "rust",
+              "headless",
+              "canvas",
+              "ac3",
+              "dolby"
+            ],
+            "repository": {
+              "type": "git",
+              "url": "https://github.com/nicmusic/wasm-m3u-player"
+            },
+            "license": "MIT",
+            "sideEffects": [
+              "./snippets/*"
+            ]
+          }
+          PKGJSON
+
+          # Fix the version placeholder (sed because heredoc doesn't expand inside single-quoted PKGJSON)
+          sed -i "s/\${{ steps.version.outputs.VERSION }}/${{ steps.version.outputs.VERSION }}/" npm-pkg/package.json
+
+      - name: Publish to npm
+        working-directory: npm-pkg
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  github-release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg
+          path: wasm-pkg/
+
+      - name: Create tarball
+        run: |
+          tar -czf wasm-m3u-player-${{ github.ref_name }}.tar.gz -C wasm-pkg .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            wasm-m3u-player-${{ github.ref_name }}.tar.gz
