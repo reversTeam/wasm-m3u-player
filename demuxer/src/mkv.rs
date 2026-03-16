@@ -150,10 +150,7 @@ impl MkvDemuxer {
                 // Try to extract profile from codec_private (avcC box)
                 if let Some(data) = codec_private {
                     if data.len() >= 4 {
-                        return format!(
-                            "avc1.{:02X}{:02X}{:02X}",
-                            data[1], data[2], data[3]
-                        );
+                        return format!("avc1.{:02X}{:02X}{:02X}", data[1], data[2], data[3]);
                     }
                 }
                 "avc1.640029".to_string()
@@ -239,7 +236,11 @@ impl MkvDemuxer {
     /// Each Cluster starts with ID 0x1F43B675, followed by a VINT size,
     /// then contains a Timestamp element (ID 0xE7) with the cluster's
     /// timestamp in TimestampScale units.
-    pub fn scan_clusters_for_seek_index(data: &[u8], timestamp_scale_ns: u64, start_offset: usize) -> SeekIndex {
+    pub fn scan_clusters_for_seek_index(
+        data: &[u8],
+        timestamp_scale_ns: u64,
+        start_offset: usize,
+    ) -> SeekIndex {
         let mut entries = Vec::new();
         let mut pos = start_offset;
 
@@ -280,12 +281,9 @@ impl MkvDemuxer {
             let search_end = (content_start + 32).min(data.len());
 
             if content_start < search_end {
-                if let Some(timestamp) =
-                    find_cluster_timestamp(&data[content_start..search_end])
-                {
+                if let Some(timestamp) = find_cluster_timestamp(&data[content_start..search_end]) {
                     // Convert from TimestampScale units to microseconds
-                    let timestamp_us =
-                        (timestamp as i64 * timestamp_scale_ns as i64) / 1_000;
+                    let timestamp_us = (timestamp as i64 * timestamp_scale_ns as i64) / 1_000;
 
                     entries.push(SeekEntry {
                         timestamp_us,
@@ -341,7 +339,10 @@ impl MkvDemuxer {
     /// Like `parse_header_streaming` but takes ownership of the Vec, avoiding
     /// the initial `data.to_vec()` copy. Use this when you already have an owned Vec
     /// (e.g. from `build_mkv_buffer()`).
-    pub fn parse_header_streaming_owned(&mut self, mut data: Vec<u8>) -> Result<MediaInfo, DemuxError> {
+    pub fn parse_header_streaming_owned(
+        &mut self,
+        mut data: Vec<u8>,
+    ) -> Result<MediaInfo, DemuxError> {
         Self::neutralize_seekhead(&mut data);
         self.parse_header_from_vec(data)
     }
@@ -411,15 +412,25 @@ impl MkvDemuxer {
             return (0, 0);
         }
         let first = data[0];
-        let len = if first & 0x80 != 0 { 1 }
-            else if first & 0x40 != 0 { 2 }
-            else if first & 0x20 != 0 { 3 }
-            else if first & 0x10 != 0 { 4 }
-            else if first & 0x08 != 0 { 5 }
-            else if first & 0x04 != 0 { 6 }
-            else if first & 0x02 != 0 { 7 }
-            else if first & 0x01 != 0 { 8 }
-            else { return (0, 0); };
+        let len = if first & 0x80 != 0 {
+            1
+        } else if first & 0x40 != 0 {
+            2
+        } else if first & 0x20 != 0 {
+            3
+        } else if first & 0x10 != 0 {
+            4
+        } else if first & 0x08 != 0 {
+            5
+        } else if first & 0x04 != 0 {
+            6
+        } else if first & 0x02 != 0 {
+            7
+        } else if first & 0x01 != 0 {
+            8
+        } else {
+            return (0, 0);
+        };
 
         if data.len() < len {
             return (0, 0);
@@ -467,7 +478,9 @@ impl MkvDemuxer {
                         codec_string,
                         width: video.pixel_width().get() as u32,
                         height: video.pixel_height().get() as u32,
-                        fps: track.default_duration().map(|d| 1_000_000_000.0 / d.get() as f64),
+                        fps: track
+                            .default_duration()
+                            .map(|d| 1_000_000_000.0 / d.get() as f64),
                         codec_config: codec_private.unwrap_or_default(),
                     });
                     video_track_ids.push(track_number);
@@ -564,9 +577,8 @@ impl Demuxer for MkvDemuxer {
                 // frame.timestamp is in ticks (1 tick = timestamp_scale_ns nanoseconds).
                 // Default scale = 1,000,000 ns = 1ms per tick.
                 // Convert: ticks * scale_ns / 1000 = microseconds
-                let timestamp_us = (frame.timestamp as i64)
-                    .saturating_mul(self.timestamp_scale_ns as i64)
-                    / 1_000;
+                let timestamp_us =
+                    (frame.timestamp as i64).saturating_mul(self.timestamp_scale_ns as i64) / 1_000;
 
                 // For audio tracks, default is_keyframe to true:
                 // AAC, Opus, FLAC all produce independently-decodable frames.
@@ -584,9 +596,10 @@ impl Demuxer for MkvDemuxer {
                     is_audio,
                     is_keyframe,
                     timestamp_us,
-                    duration_us: frame.duration.map(|d| {
-                        (d as i64).saturating_mul(self.timestamp_scale_ns as i64) / 1_000
-                    }).unwrap_or(0),
+                    duration_us: frame
+                        .duration
+                        .map(|d| (d as i64).saturating_mul(self.timestamp_scale_ns as i64) / 1_000)
+                        .unwrap_or(0),
                     data: frame.data,
                 }))
             }
@@ -619,11 +632,13 @@ impl Demuxer for MkvDemuxer {
                 Ok(true) => {
                     count += 1;
                     let frame_ts_us = (frame.timestamp as i64)
-                        .saturating_mul(self.timestamp_scale_ns as i64) / 1_000;
+                        .saturating_mul(self.timestamp_scale_ns as i64)
+                        / 1_000;
 
                     // Track last video keyframe before target
                     let is_video = self.video_track_ids.contains(&frame.track);
-                    if is_video && frame.is_keyframe.unwrap_or(false) && frame_ts_us <= timestamp_us {
+                    if is_video && frame.is_keyframe.unwrap_or(false) && frame_ts_us <= timestamp_us
+                    {
                         skip_count = count - 1;
                     }
 
@@ -633,14 +648,21 @@ impl Demuxer for MkvDemuxer {
                     }
                 }
                 Ok(false) => break, // EOF
-                Err(e) => return Err(DemuxError::InvalidData(format!("MKV seek scan error: {}", e))),
+                Err(e) => {
+                    return Err(DemuxError::InvalidData(format!(
+                        "MKV seek scan error: {}",
+                        e
+                    )))
+                }
             }
         }
 
         // Phase 2: Re-create MatroskaFile from stored raw data
         // MatroskaFile has no rewind/into_inner, so we use the copy saved during parse_header.
         // raw_data is Bytes (refcounted), so .to_vec() is the only copy needed here.
-        let data_vec = self.raw_data.as_ref()
+        let data_vec = self
+            .raw_data
+            .as_ref()
             .ok_or_else(|| DemuxError::InvalidData("No raw data stored for seek rewind".into()))?
             .to_vec();
         self.mkv.take(); // drop the consumed demuxer
@@ -1092,7 +1114,7 @@ mod tests {
         // Cluster size: Timestamp element (4 bytes) + extra content
         let content_size = 4 + content_extra;
         data.push(0x80 | content_size as u8); // VINT 1-byte size
-        // Timestamp element: ID=0xE7, size=0x82 (2 bytes), value
+                                              // Timestamp element: ID=0xE7, size=0x82 (2 bytes), value
         data.push(0xE7);
         data.push(0x82);
         data.extend_from_slice(&timestamp.to_be_bytes());
@@ -1238,7 +1260,10 @@ mod tests {
     #[test]
     fn demuxer_vint_4_byte() {
         // 0x10 0x00 0x01 0x00 → len=4, value=256
-        assert_eq!(MkvDemuxer::decode_ebml_vint(&[0x10, 0x00, 0x01, 0x00]), (4, 256));
+        assert_eq!(
+            MkvDemuxer::decode_ebml_vint(&[0x10, 0x00, 0x01, 0x00]),
+            (4, 256)
+        );
     }
 
     #[test]
@@ -1467,7 +1492,10 @@ mod tests {
     #[test]
     fn map_audio_codec_dts_is_unknown() {
         assert_eq!(MkvDemuxer::map_audio_codec("A_DTS"), "unknown:A_DTS");
-        assert_eq!(MkvDemuxer::map_audio_codec("A_DTS/EXPRESS"), "unknown:A_DTS/EXPRESS");
+        assert_eq!(
+            MkvDemuxer::map_audio_codec("A_DTS/EXPRESS"),
+            "unknown:A_DTS/EXPRESS"
+        );
     }
 
     #[test]

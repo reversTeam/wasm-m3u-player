@@ -50,7 +50,7 @@ impl std::fmt::Display for DecodeError {
 struct Bsi {
     fscod: usize,
     frmsizecod: usize,
-    frmsize: usize,  // frame size in bytes
+    frmsize: usize, // frame size in bytes
     bsid: u8,
     bsmod: u8,
     acmod: u8,
@@ -74,14 +74,38 @@ const EAC3_BLOCKS: [usize; 4] = [1, 2, 3, 6];
 /// Block 0 always has new exponents (D15=1). Bits 4..0 encode blocks 1-5:
 /// bit=0 → new (1), bit=1 → reuse (0). Bit 4=block1, bit 0=block5.
 const EAC3_FRM_EXPSTR: [[u8; 6]; 32] = [
-    [1,1,1,1,1,1],[1,1,1,1,1,0],[1,1,1,1,0,1],[1,1,1,1,0,0],
-    [1,1,1,0,1,1],[1,1,1,0,1,0],[1,1,1,0,0,1],[1,1,1,0,0,0],
-    [1,1,0,1,1,1],[1,1,0,1,1,0],[1,1,0,1,0,1],[1,1,0,1,0,0],
-    [1,1,0,0,1,1],[1,1,0,0,1,0],[1,1,0,0,0,1],[1,1,0,0,0,0],
-    [1,0,1,1,1,1],[1,0,1,1,1,0],[1,0,1,1,0,1],[1,0,1,1,0,0],
-    [1,0,1,0,1,1],[1,0,1,0,1,0],[1,0,1,0,0,1],[1,0,1,0,0,0],
-    [1,0,0,1,1,1],[1,0,0,1,1,0],[1,0,0,1,0,1],[1,0,0,1,0,0],
-    [1,0,0,0,1,1],[1,0,0,0,1,0],[1,0,0,0,0,1],[1,0,0,0,0,0],
+    [1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 0],
+    [1, 1, 1, 1, 0, 1],
+    [1, 1, 1, 1, 0, 0],
+    [1, 1, 1, 0, 1, 1],
+    [1, 1, 1, 0, 1, 0],
+    [1, 1, 1, 0, 0, 1],
+    [1, 1, 1, 0, 0, 0],
+    [1, 1, 0, 1, 1, 1],
+    [1, 1, 0, 1, 1, 0],
+    [1, 1, 0, 1, 0, 1],
+    [1, 1, 0, 1, 0, 0],
+    [1, 1, 0, 0, 1, 1],
+    [1, 1, 0, 0, 1, 0],
+    [1, 1, 0, 0, 0, 1],
+    [1, 1, 0, 0, 0, 0],
+    [1, 0, 1, 1, 1, 1],
+    [1, 0, 1, 1, 1, 0],
+    [1, 0, 1, 1, 0, 1],
+    [1, 0, 1, 1, 0, 0],
+    [1, 0, 1, 0, 1, 1],
+    [1, 0, 1, 0, 1, 0],
+    [1, 0, 1, 0, 0, 1],
+    [1, 0, 1, 0, 0, 0],
+    [1, 0, 0, 1, 1, 1],
+    [1, 0, 0, 1, 1, 0],
+    [1, 0, 0, 1, 0, 1],
+    [1, 0, 0, 1, 0, 0],
+    [1, 0, 0, 0, 1, 1],
+    [1, 0, 0, 0, 1, 0],
+    [1, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0],
 ];
 
 /// Parsed E-AC-3 BSI (Bit Stream Information) — frame-level parameters.
@@ -90,14 +114,14 @@ const EAC3_FRM_EXPSTR: [[u8; 6]; 32] = [
 /// not per audio block.
 struct EacBsi {
     // --- Syncinfo ---
-    strmtyp: u8,        // 2 bits: 0=independent, 1=dependent, 2=AC-3 conversion
-    substreamid: u8,    // 3 bits
-    frmsiz: usize,      // 11 bits raw value
-    frmsize: usize,     // (frmsiz + 1) * 2 bytes
-    fscod: usize,       // 2 bits: sample rate code
-    numblkscod: u8,     // 2 bits: 0=1block, 1=2, 2=3, 3=6
-    num_blocks: usize,  // derived: [1, 2, 3, 6][numblkscod]
-    sample_rate: u32,   // derived from fscod (or fscod2)
+    strmtyp: u8,       // 2 bits: 0=independent, 1=dependent, 2=AC-3 conversion
+    substreamid: u8,   // 3 bits
+    frmsiz: usize,     // 11 bits raw value
+    frmsize: usize,    // (frmsiz + 1) * 2 bytes
+    fscod: usize,      // 2 bits: sample rate code
+    numblkscod: u8,    // 2 bits: 0=1block, 1=2, 2=3, 3=6
+    num_blocks: usize, // derived: [1, 2, 3, 6][numblkscod]
+    sample_rate: u32,  // derived from fscod (or fscod2)
 
     // --- BSI core ---
     acmod: u8,
@@ -106,17 +130,17 @@ struct EacBsi {
     nfchans: usize,
     dialnorm: u8,
     bsmod: u8,
-    cmixlev: usize,     // center downmix level
-    surmixlev: usize,   // surround downmix level
+    cmixlev: usize,   // center downmix level
+    surmixlev: usize, // surround downmix level
 
     // --- audfrm syntax flags (per FFmpeg ff_eac3_parse_header) ---
-    block_switch_syntax: bool,  // if false: no blksw in audio blocks
-    dither_flag_syntax: bool,   // if false: dither always ON
-    bit_allocation_syntax: bool,// if false: use default BA params
-    fast_gain_syntax: bool,     // if false: no fast gain in audio blocks
-    dba_syntax: bool,           // if false: no delta BA in audio blocks
-    skip_syntax: bool,          // if false: no skip field in audio blocks
-    snr_offset_strategy: u8,    // 0=frame-level, 1-3=per-block in audio block
+    block_switch_syntax: bool,   // if false: no blksw in audio blocks
+    dither_flag_syntax: bool,    // if false: dither always ON
+    bit_allocation_syntax: bool, // if false: use default BA params
+    fast_gain_syntax: bool,      // if false: no fast gain in audio blocks
+    dba_syntax: bool,            // if false: no delta BA in audio blocks
+    skip_syntax: bool,           // if false: no skip field in audio blocks
+    snr_offset_strategy: u8,     // 0=frame-level, 1-3=per-block in audio block
 
     // --- Coupling (frame-level flags) ---
     cpl_strategy_exists: [bool; EAC3_MAX_BLOCKS],
@@ -266,28 +290,43 @@ impl AudioBlock {
             cplinu: false,
             chincpl: [false; MAX_CHANNELS],
             phsflginu: false,
-            cplbegf: 0, cplendf: 0,
-            ncplsubnd: 0, ncplbnd: 0,
+            cplbegf: 0,
+            cplendf: 0,
+            ncplsubnd: 0,
+            ncplbnd: 0,
             cplbndstrc: [false; 18],
             cplcoe: [false; MAX_CHANNELS],
             cplco: [[0.0; 18]; MAX_CHANNELS],
-            cplstrtmant: 0, cplendmant: 0,
+            cplstrtmant: 0,
+            cplendmant: 0,
             chexpstr: [0; MAX_CHANNELS],
-            cplexpstr: 0, lfeexpstr: 0,
+            cplexpstr: 0,
+            lfeexpstr: 0,
             strtmant: [0; MAX_CHANNELS],
             endmant: [253; MAX_CHANNELS],
             chbwcod: [0; MAX_CHANNELS],
             exps: [[0; 256]; MAX_CHANNELS],
             cplexps: [0; 256],
             lfeexps: [0; 256],
-            sdcycod: 0, fdcycod: 0, sgaincod: 0, dbpbcod: 0, floorcod: 0,
+            sdcycod: 0,
+            fdcycod: 0,
+            sgaincod: 0,
+            dbpbcod: 0,
+            floorcod: 0,
             csnroffst: 0,
             fsnroffst: [0; MAX_CHANNELS],
             fgaincod: [0; MAX_CHANNELS],
-            cplfsnroffst: 0, cplfgaincod: 0,
-            lfefsnroffst: 0, lfefgaincod: 0,
-            cplfleak: 0, cplsleak: 0,
-            sdecay: 0, fdecay: 0, sgain: 0, dbknee: 0, floor: 0,
+            cplfsnroffst: 0,
+            cplfgaincod: 0,
+            lfefsnroffst: 0,
+            lfefgaincod: 0,
+            cplfleak: 0,
+            cplsleak: 0,
+            sdecay: 0,
+            fdecay: 0,
+            sgain: 0,
+            dbknee: 0,
+            floor: 0,
             deltbae: [2; MAX_CHANNELS],
             cpldeltbae: 2,
             deltnseg: [0; MAX_CHANNELS],
@@ -320,8 +359,12 @@ impl Ac3Decoder {
     pub fn new() -> Self {
         Self {
             imdcts: [
-                Imdct::new(), Imdct::new(), Imdct::new(),
-                Imdct::new(), Imdct::new(), Imdct::new(),
+                Imdct::new(),
+                Imdct::new(),
+                Imdct::new(),
+                Imdct::new(),
+                Imdct::new(),
+                Imdct::new(),
             ],
             samples: [[0.0; AC3_FRAME_SAMPLES]; MAX_CHANNELS],
             dither_state: 1,
@@ -351,22 +394,28 @@ impl Ac3Decoder {
 
     /// Get the frame size from the header without full parsing.
     pub fn frame_size(data: &[u8]) -> Option<(usize, u8)> {
-        if data.len() < 8 { return None; }
-        if data[0] != 0x0B || data[1] != 0x77 { return None; }
+        if data.len() < 8 {
+            return None;
+        }
+        if data[0] != 0x0B || data[1] != 0x77 {
+            return None;
+        }
 
         let bsid = ((data[5] >> 3) & 0x1F) as u8;
 
         if bsid <= 10 {
             let fscod = ((data[4] >> 6) & 0x03) as usize;
             let frmsizecod = (data[4] & 0x3F) as usize;
-            if fscod >= 3 || frmsizecod / 2 >= 19 { return None; }
+            if fscod >= 3 || frmsizecod / 2 >= 19 {
+                return None;
+            }
             let frame_size = FRAME_SIZE_TAB[frmsizecod / 2][fscod] as usize * 2;
             Some((frame_size, bsid))
         } else if bsid <= 16 {
             let mut br = BitReader::new(data);
             br.skip(16); // sync
-            br.skip(2);  // strmtyp
-            br.skip(3);  // substreamid
+            br.skip(2); // strmtyp
+            br.skip(3); // substreamid
             let frmsiz = br.read(11) as usize;
             Some(((frmsiz + 1) * 2, bsid))
         } else {
@@ -377,14 +426,19 @@ impl Ac3Decoder {
     /// Decode one AC-3 or E-AC-3 frame.
     /// Scans for the 0x0B77 sync word and checks bsid to determine format.
     pub fn decode_frame(&mut self, data: &[u8]) -> Result<DecodedFrame, DecodeError> {
-        if data.len() < 8 { return Err(DecodeError::NotEnoughData); }
+        if data.len() < 8 {
+            return Err(DecodeError::NotEnoughData);
+        }
 
         // Scan for sync word — MKV blocks may have alignment padding
-        let offset = self.find_sync_offset(data)
+        let offset = self
+            .find_sync_offset(data)
             .ok_or(DecodeError::InvalidSync)?;
 
         let frame_data = &data[offset..];
-        if frame_data.len() < 8 { return Err(DecodeError::NotEnoughData); }
+        if frame_data.len() < 8 {
+            return Err(DecodeError::NotEnoughData);
+        }
 
         // Check bsid at fixed byte position BEFORE sequential parsing.
         // bsid is in byte 5, bits [7:3] (5 MSBs).
@@ -447,7 +501,9 @@ impl Ac3Decoder {
 
         // Skip dependent substreams for now (strmtyp=1)
         if eac_bsi.strmtyp == 1 {
-            return Err(DecodeError::InvalidHeader("E-AC-3 dependent substream not supported".into()));
+            return Err(DecodeError::InvalidHeader(
+                "E-AC-3 dependent substream not supported".into(),
+            ));
         }
 
         let total_channels = eac_bsi.nfchans + if eac_bsi.lfeon { 1 } else { 0 };
@@ -537,26 +593,42 @@ impl Ac3Decoder {
         // dialnorm
         br.skip(5);
         // compre
-        if br.read_bool() { br.skip(8); }
+        if br.read_bool() {
+            br.skip(8);
+        }
         // langcode
-        if br.read_bool() { br.skip(8); }
+        if br.read_bool() {
+            br.skip(8);
+        }
         // audprodie
-        if br.read_bool() { br.skip(7); }
+        if br.read_bool() {
+            br.skip(7);
+        }
 
         // If dual mono (acmod==0), duplicate fields
         if acmod == 0 {
             br.skip(5); // dialnorm2
-            if br.read_bool() { br.skip(8); } // compr2
-            if br.read_bool() { br.skip(8); } // langcod2
-            if br.read_bool() { br.skip(7); } // audprodie2
+            if br.read_bool() {
+                br.skip(8);
+            } // compr2
+            if br.read_bool() {
+                br.skip(8);
+            } // langcod2
+            if br.read_bool() {
+                br.skip(7);
+            } // audprodie2
         }
 
         br.skip(1); // copyrightb
         br.skip(1); // origbs
 
         // timecod1e/timecod2e (for bsid 6 = Annex D, these are different)
-        if br.read_bool() { br.skip(14); }
-        if br.read_bool() { br.skip(14); }
+        if br.read_bool() {
+            br.skip(14);
+        }
+        if br.read_bool() {
+            br.skip(14);
+        }
 
         // addbsie
         if br.read_bool() {
@@ -565,8 +637,16 @@ impl Ac3Decoder {
         }
 
         Ok(Bsi {
-            fscod, frmsizecod, frmsize, bsid, bsmod, acmod,
-            nfchans, lfeon, cmixlev, surmixlev,
+            fscod,
+            frmsizecod,
+            frmsize,
+            bsid,
+            bsmod,
+            acmod,
+            nfchans,
+            lfeon,
+            cmixlev,
+            surmixlev,
         })
     }
 
@@ -589,7 +669,9 @@ impl Ac3Decoder {
 
         // Reject dependent substreams early
         if eac.strmtyp == 1 {
-            return Err(DecodeError::InvalidHeader("E-AC-3 dependent substream not supported".into()));
+            return Err(DecodeError::InvalidHeader(
+                "E-AC-3 dependent substream not supported".into(),
+            ));
         }
 
         // Minimum frame size: must be large enough for at least the sync + header
@@ -614,9 +696,10 @@ impl Ac3Decoder {
 
         // Validate num_blocks
         if !matches!(eac.num_blocks, 1 | 2 | 3 | 6) {
-            return Err(DecodeError::InvalidHeader(
-                format!("invalid num_blocks: {}", eac.num_blocks),
-            ));
+            return Err(DecodeError::InvalidHeader(format!(
+                "invalid num_blocks: {}",
+                eac.num_blocks
+            )));
         }
 
         eac.acmod = br.read(3) as u8;
@@ -632,32 +715,39 @@ impl Ac3Decoder {
 
         eac.nfchans = NFCHANS[(eac.acmod as usize).min(7)];
         if eac.nfchans > MAX_CHANNELS {
-            return Err(DecodeError::InvalidHeader(
-                format!("nfchans {} exceeds MAX_CHANNELS {}", eac.nfchans, MAX_CHANNELS),
-            ));
+            return Err(DecodeError::InvalidHeader(format!(
+                "nfchans {} exceeds MAX_CHANNELS {}",
+                eac.nfchans, MAX_CHANNELS
+            )));
         }
 
         // ===== BSI metadata =====
         eac.dialnorm = br.read(5) as u8;
         // compre
-        if br.read_bool() { br.skip(8); }
+        if br.read_bool() {
+            br.skip(8);
+        }
 
         // Dual mono second dialogue normalization
         if eac.acmod == 0 {
             br.skip(5); // dialnorm2
-            if br.read_bool() { br.skip(8); } // compr2
+            if br.read_bool() {
+                br.skip(8);
+            } // compr2
         }
 
         // ---- Correct order per ETSI TS 102 366, Table E.1 ----
         // 1. chanmape (dependent stream only)
         if eac.strmtyp == 1 {
-            if br.read_bool() { // chanmape
+            if br.read_bool() {
+                // chanmape
                 br.skip(16); // chanmap
             }
         }
 
         // 2. mixmdate — mixing metadata
-        if br.read_bool() { // mixmdate
+        if br.read_bool() {
+            // mixmdate
             if eac.acmod > 0x2 {
                 br.skip(2); // dmixmod
             }
@@ -670,23 +760,33 @@ impl Ac3Decoder {
                 br.skip(3); // lorosurmixlev
             }
             if eac.lfeon {
-                if br.read_bool() { // lfemixlevcode
+                if br.read_bool() {
+                    // lfemixlevcode
                     br.skip(5);
                 }
             }
             if eac.strmtyp == 0 {
-                if br.read_bool() { br.skip(6); } // pgmscle → pgmscl
+                if br.read_bool() {
+                    br.skip(6);
+                } // pgmscle → pgmscl
                 if eac.acmod == 0 {
-                    if br.read_bool() { br.skip(6); } // pgmscl2e → pgmscl2
+                    if br.read_bool() {
+                        br.skip(6);
+                    } // pgmscl2e → pgmscl2
                 }
-                if br.read_bool() { // extmixleve
+                if br.read_bool() {
+                    // extmixleve
                     br.skip(5); // extmixlev
                 }
                 let mixdef = br.read(2) as u8;
                 match mixdef {
                     0 => { /* no additional data */ }
-                    1 => { br.skip(5); } // premixcmpsel + drcsrc + premixcmpscl
-                    2 => { br.skip(12); } // mixdata
+                    1 => {
+                        br.skip(5);
+                    } // premixcmpsel + drcsrc + premixcmpscl
+                    2 => {
+                        br.skip(12);
+                    } // mixdata
                     3 => {
                         let mixdeflen = br.read(5) as usize;
                         br.skip((mixdeflen + 2) * 8); // skip variable-length mix data
@@ -694,12 +794,14 @@ impl Ac3Decoder {
                     _ => {}
                 }
                 if eac.acmod < 0x2 {
-                    if br.read_bool() { // paninfoe
+                    if br.read_bool() {
+                        // paninfoe
                         br.skip(8); // panmean
                         br.skip(6); // paninfo
                     }
                     if eac.acmod == 0 {
-                        if br.read_bool() { // paninfo2e
+                        if br.read_bool() {
+                            // paninfo2e
                             br.skip(8);
                             br.skip(6);
                         }
@@ -711,7 +813,8 @@ impl Ac3Decoder {
                         br.skip(5); // blkmixcfginfo
                     } else {
                         for _blk in 0..eac.num_blocks {
-                            if br.read_bool() { // blkmixcfginfoe
+                            if br.read_bool() {
+                                // blkmixcfginfoe
                                 br.skip(5);
                             }
                         }
@@ -721,7 +824,8 @@ impl Ac3Decoder {
         }
 
         // 3. infomdate — informational metadata
-        if br.read_bool() { // infomdate
+        if br.read_bool() {
+            // infomdate
             eac.bsmod = br.read(3) as u8;
             br.skip(1); // copyrightb
             br.skip(1); // origbs
@@ -758,7 +862,8 @@ impl Ac3Decoder {
 
         // 5. blkid (dependent stream type 2 only)
         if eac.strmtyp == 2 {
-            if br.read_bool() { // blkid
+            if br.read_bool() {
+                // blkid
                 br.skip(6); // frmsizecod
             }
         }
@@ -802,7 +907,8 @@ impl Ac3Decoder {
         let parse_spx_atten_data = br.read_bool();
 
         // --- Coupling strategy per block ---
-        if eac.acmod > 1 { // multi-channel
+        if eac.acmod > 1 {
+            // multi-channel
             for blk in 0..num_blocks {
                 eac.cpl_strategy_exists[blk] = if blk == 0 { true } else { br.read_bool() };
                 if eac.cpl_strategy_exists[blk] {
@@ -874,7 +980,8 @@ impl Ac3Decoder {
                     } else {
                         eac.lfeexpstr[blk]
                     };
-                    if exp_str != 0 { // EXP_REUSE = 0
+                    if exp_str != 0 {
+                        // EXP_REUSE = 0
                         use_aht = false;
                         break;
                     }
@@ -899,9 +1006,10 @@ impl Ac3Decoder {
         // --- Transient pre-noise processing ---
         if _parse_transient_proc_info {
             for _ch in 0..nfchans {
-                if br.read_bool() { // channel in transient processing
+                if br.read_bool() {
+                    // channel in transient processing
                     br.skip(10); // transient processing location
-                    br.skip(8);  // transient processing length
+                    br.skip(8); // transient processing length
                 }
             }
         }
@@ -921,7 +1029,9 @@ impl Ac3Decoder {
             let words_per_frame = eac.frmsize / 2;
             let log2_wpf = if words_per_frame > 2 {
                 (words_per_frame - 2).next_power_of_two().trailing_zeros() as usize
-            } else { 0 };
+            } else {
+                0
+            };
             let block_start_bits = (num_blocks - 1) * (4 + log2_wpf);
             br.skip(block_start_bits);
         }
@@ -940,13 +1050,21 @@ impl Ac3Decoder {
         let nfchans = bsi.nfchans;
 
         // Block switch & dither flags
-        for ch in 0..nfchans { ab.blksw[ch] = br.read_bool(); }
-        for ch in 0..nfchans { ab.dithflag[ch] = br.read_bool(); }
+        for ch in 0..nfchans {
+            ab.blksw[ch] = br.read_bool();
+        }
+        for ch in 0..nfchans {
+            ab.dithflag[ch] = br.read_bool();
+        }
 
         // Dynamic range
-        if br.read_bool() { br.skip(8); }
+        if br.read_bool() {
+            br.skip(8);
+        }
         if bsi.acmod == 0x0 {
-            if br.read_bool() { br.skip(8); }
+            if br.read_bool() {
+                br.skip(8);
+            }
         }
 
         // === Coupling strategy ===
@@ -954,8 +1072,12 @@ impl Ac3Decoder {
         if cplstre {
             ab.cplinu = br.read_bool();
             if ab.cplinu {
-                for ch in 0..nfchans { ab.chincpl[ch] = br.read_bool(); }
-                if bsi.acmod == 0x2 { ab.phsflginu = br.read_bool(); }
+                for ch in 0..nfchans {
+                    ab.chincpl[ch] = br.read_bool();
+                }
+                if bsi.acmod == 0x2 {
+                    ab.phsflginu = br.read_bool();
+                }
                 ab.cplbegf = br.read(4) as usize;
                 ab.cplendf = br.read(4) as usize;
                 if ab.cplendf + 3 < ab.cplbegf {
@@ -963,18 +1085,23 @@ impl Ac3Decoder {
                 }
                 ab.ncplsubnd = 3 + ab.cplendf - ab.cplbegf;
                 if ab.ncplsubnd > 18 {
-                    return Err(DecodeError::BlockError(
-                        format!("ncplsubnd {} > 18", ab.ncplsubnd),
-                    ));
+                    return Err(DecodeError::BlockError(format!(
+                        "ncplsubnd {} > 18",
+                        ab.ncplsubnd
+                    )));
                 }
                 ab.ncplbnd = ab.ncplsubnd;
                 ab.cplbndstrc[0] = false;
                 for bnd in 1..ab.ncplsubnd {
                     ab.cplbndstrc[bnd] = br.read_bool();
-                    if ab.cplbndstrc[bnd] { ab.ncplbnd -= 1; }
+                    if ab.cplbndstrc[bnd] {
+                        ab.ncplbnd -= 1;
+                    }
                 }
             } else {
-                for ch in 0..nfchans { ab.chincpl[ch] = false; }
+                for ch in 0..nfchans {
+                    ab.chincpl[ch] = false;
+                }
             }
         }
 
@@ -1032,9 +1159,15 @@ impl Ac3Decoder {
         }
 
         // === Exponent strategies ===
-        if ab.cplinu { ab.cplexpstr = br.read(2) as u8; }
-        for ch in 0..nfchans { ab.chexpstr[ch] = br.read(2) as u8; }
-        if bsi.lfeon { ab.lfeexpstr = br.read(1) as u8; }
+        if ab.cplinu {
+            ab.cplexpstr = br.read(2) as u8;
+        }
+        for ch in 0..nfchans {
+            ab.chexpstr[ch] = br.read(2) as u8;
+        }
+        if bsi.lfeon {
+            ab.lfeexpstr = br.read(1) as u8;
+        }
 
         // === Channel bandwidth codes ===
         for ch in 0..nfchans {
@@ -1054,7 +1187,9 @@ impl Ac3Decoder {
                 let grpsize = EXPONENT_GROUP_SIZE[ab.cplexpstr as usize];
                 let ncplgrps = if grpsize > 0 {
                     (ab.cplendmant - ab.cplstrtmant) / (grpsize * 3)
-                } else { 0 };
+                } else {
+                    0
+                };
 
                 let cplabsexp = br.read(4) as i32;
                 unpack_exponents(br, &mut ab.cplexps, cplabsexp << 1, ncplgrps, grpsize, 0);
@@ -1132,8 +1267,12 @@ impl Ac3Decoder {
         // === Delta bit allocation ===
         let deltbaie = br.read_bool();
         if deltbaie {
-            if ab.cplinu { ab.cpldeltbae = br.read(2) as u8; }
-            for ch in 0..nfchans { ab.deltbae[ch] = br.read(2) as u8; }
+            if ab.cplinu {
+                ab.cpldeltbae = br.read(2) as u8;
+            }
+            for ch in 0..nfchans {
+                ab.deltbae[ch] = br.read(2) as u8;
+            }
 
             if ab.cplinu && ab.cpldeltbae == 1 {
                 let _nseg = br.read(3) as usize;
@@ -1151,7 +1290,9 @@ impl Ac3Decoder {
             }
         } else if blk == 0 {
             ab.cpldeltbae = 2;
-            for ch in 0..nfchans { ab.deltbae[ch] = 2; }
+            for ch in 0..nfchans {
+                ab.deltbae[ch] = 2;
+            }
         }
 
         // === Compute derived BA parameters ===
@@ -1164,8 +1305,11 @@ impl Ac3Decoder {
         // === Run bit allocation for each channel ===
         // Extract BA params to avoid borrow conflicts
         let ba_params = BaParams {
-            sdecay: ab.sdecay, fdecay: ab.fdecay, sgain: ab.sgain,
-            dbknee: ab.dbknee, floor: ab.floor,
+            sdecay: ab.sdecay,
+            fdecay: ab.fdecay,
+            sgain: ab.sgain,
+            dbknee: ab.dbknee,
+            floor: ab.floor,
         };
 
         for ch in 0..nfchans {
@@ -1196,7 +1340,8 @@ impl Ac3Decoder {
                 &exps_copy,
                 fgain,
                 snroffset,
-                0, 0,
+                0,
+                0,
                 delt.as_ref(),
                 &mut ab.baps[ch],
             );
@@ -1213,11 +1358,15 @@ impl Ac3Decoder {
             exps_copy.copy_from_slice(&ab.cplexps);
 
             bit_allocation(
-                bsi.fscod, &ba_params,
-                ab.cplstrtmant, ab.cplendmant,
+                bsi.fscod,
+                &ba_params,
+                ab.cplstrtmant,
+                ab.cplendmant,
                 &exps_copy,
-                fgain, snroffset,
-                fastleak, slowleak,
+                fgain,
+                snroffset,
+                fastleak,
+                slowleak,
                 None,
                 &mut ab.cplbap,
             );
@@ -1232,9 +1381,17 @@ impl Ac3Decoder {
             exps_copy.copy_from_slice(&ab.lfeexps);
 
             bit_allocation(
-                bsi.fscod, &ba_params, 0, LFE_COEFS,
-                &exps_copy, fgain, snroffset,
-                0, 0, None, &mut ab.lfebap,
+                bsi.fscod,
+                &ba_params,
+                0,
+                LFE_COEFS,
+                &exps_copy,
+                fgain,
+                snroffset,
+                0,
+                0,
+                None,
+                &mut ab.lfebap,
             );
         }
 
@@ -1343,7 +1500,11 @@ impl Ac3Decoder {
             for i in 0..LFE_COEFS {
                 lfe_coeffs[i] = ab.lfemant[i];
             }
-            self.imdcts[lfe_ch].process256(&lfe_coeffs, &mut self.samples[lfe_ch], blk * BLOCK_SAMPLES);
+            self.imdcts[lfe_ch].process256(
+                &lfe_coeffs,
+                &mut self.samples[lfe_ch],
+                blk * BLOCK_SAMPLES,
+            );
         }
 
         Ok(())
@@ -1388,9 +1549,13 @@ impl Ac3Decoder {
         }
 
         // 3. Dynamic range compression (same as AC-3)
-        if br.read_bool() { br.skip(8); }
+        if br.read_bool() {
+            br.skip(8);
+        }
         if acmod == 0x0 {
-            if br.read_bool() { br.skip(8); }
+            if br.read_bool() {
+                br.skip(8);
+            }
         }
 
         // 4. SPX — full parsing in audio block (E-AC-3 specific)
@@ -1413,17 +1578,19 @@ impl Ac3Decoder {
                     let spxendf = br.read(3) as usize + 1;
                     // SPX band structure
                     let nspxbnds = spxendf - spxbegf + 1;
-                    if br.read_bool() { // spxbndstrce (or first occurrence)
+                    if br.read_bool() {
+                        // spxbndstrce (or first occurrence)
                         for _bnd in 1..nspxbnds.min(18) {
                             br.skip(1); // spxbndstrc
                         }
                     }
                     // SPX coordinates per channel
                     for _ch in 0..nfchans.min(MAX_CHANNELS) {
-                        if br.read_bool() { // spxcoe
+                        if br.read_bool() {
+                            // spxcoe
                             br.skip(5); // spxblnd
                             br.skip(2); // mstrspxco
-                            // Per-band coordinates
+                                        // Per-band coordinates
                             for _bnd in 0..nspxbnds.min(18) {
                                 br.skip(4); // spxcoexp
                                 br.skip(4); // spxcomant
@@ -1450,21 +1617,25 @@ impl Ac3Decoder {
                 ab.cplendf = br.read(4) as usize;
 
                 if ab.cplendf + 3 < ab.cplbegf {
-                    return Err(DecodeError::BlockError(
-                        format!("E-AC-3: cplendf({}) < cplbegf({})-3", ab.cplendf, ab.cplbegf),
-                    ));
+                    return Err(DecodeError::BlockError(format!(
+                        "E-AC-3: cplendf({}) < cplbegf({})-3",
+                        ab.cplendf, ab.cplbegf
+                    )));
                 }
                 ab.ncplsubnd = 3 + ab.cplendf - ab.cplbegf;
                 if ab.ncplsubnd > 18 {
-                    return Err(DecodeError::BlockError(
-                        format!("E-AC-3: ncplsubnd {} > 18", ab.ncplsubnd),
-                    ));
+                    return Err(DecodeError::BlockError(format!(
+                        "E-AC-3: ncplsubnd {} > 18",
+                        ab.ncplsubnd
+                    )));
                 }
                 ab.ncplbnd = ab.ncplsubnd;
                 ab.cplbndstrc[0] = false;
                 for bnd in 1..ab.ncplsubnd {
                     ab.cplbndstrc[bnd] = br.read_bool();
-                    if ab.cplbndstrc[bnd] { ab.ncplbnd -= 1; }
+                    if ab.cplbndstrc[bnd] {
+                        ab.ncplbnd -= 1;
+                    }
                 }
             } else {
                 ab.cplinu = false;
@@ -1553,7 +1724,9 @@ impl Ac3Decoder {
                 let grpsize = EXPONENT_GROUP_SIZE[cplexpstr as usize];
                 let ncplgrps = if grpsize > 0 {
                     (ab.cplendmant - ab.cplstrtmant) / (grpsize * 3)
-                } else { 0 };
+                } else {
+                    0
+                };
                 let cplabsexp = br.read(4) as i32;
                 unpack_exponents(br, &mut ab.cplexps, cplabsexp << 1, ncplgrps, grpsize, 0);
             }
@@ -1668,7 +1841,9 @@ impl Ac3Decoder {
         if eac_bsi.dba_syntax {
             let deltbaie = br.read_bool();
             if deltbaie {
-                if ab.cplinu { ab.cpldeltbae = br.read(2) as u8; }
+                if ab.cplinu {
+                    ab.cpldeltbae = br.read(2) as u8;
+                }
                 for ch in 0..nfchans.min(MAX_CHANNELS) {
                     ab.deltbae[ch] = br.read(2) as u8;
                 }
@@ -1708,16 +1883,25 @@ impl Ac3Decoder {
                     ba: ab.deltba[ch],
                     len: ab.deltlen[ch],
                 })
-            } else { None };
+            } else {
+                None
+            };
 
             let mut exps_copy = [0u8; 256];
             exps_copy.copy_from_slice(&ab.exps[ch]);
 
             bit_allocation(
-                eac_bsi.fscod, &ba_params,
-                ab.strtmant[ch], ab.endmant[ch],
-                &exps_copy, fgain_all, snroffset_all,
-                0, 0, delt.as_ref(), &mut ab.baps[ch],
+                eac_bsi.fscod,
+                &ba_params,
+                ab.strtmant[ch],
+                ab.endmant[ch],
+                &exps_copy,
+                fgain_all,
+                snroffset_all,
+                0,
+                0,
+                delt.as_ref(),
+                &mut ab.baps[ch],
             );
         }
 
@@ -1727,10 +1911,17 @@ impl Ac3Decoder {
             exps_copy.copy_from_slice(&ab.cplexps);
 
             bit_allocation(
-                eac_bsi.fscod, &ba_params,
-                ab.cplstrtmant, ab.cplendmant,
-                &exps_copy, fgain_all, snroffset_all,
-                0, 0, None, &mut ab.cplbap,
+                eac_bsi.fscod,
+                &ba_params,
+                ab.cplstrtmant,
+                ab.cplendmant,
+                &exps_copy,
+                fgain_all,
+                snroffset_all,
+                0,
+                0,
+                None,
+                &mut ab.cplbap,
             );
         }
 
@@ -1740,9 +1931,17 @@ impl Ac3Decoder {
             exps_copy.copy_from_slice(&ab.lfeexps);
 
             bit_allocation(
-                eac_bsi.fscod, &ba_params, 0, LFE_COEFS,
-                &exps_copy, fgain_all, snroffset_all,
-                0, 0, None, &mut ab.lfebap,
+                eac_bsi.fscod,
+                &ba_params,
+                0,
+                LFE_COEFS,
+                &exps_copy,
+                fgain_all,
+                snroffset_all,
+                0,
+                0,
+                None,
+                &mut ab.lfebap,
             );
         }
 
@@ -1803,7 +2002,9 @@ impl Ac3Decoder {
                     for sbnd in 0..ab.ncplsubnd.min(18) {
                         for bin in 0..12 {
                             let cpl_bin = sbnd * 12 + bin;
-                            if cpl_bin >= 256 { break; }
+                            if cpl_bin >= 256 {
+                                break;
+                            }
                             let mantissa = if ab.cplmant[cpl_bin] == 0.0 && ab.dithflag[ch] {
                                 let exp = ab.cplexps[cpl_bin];
                                 self.dither() * 2.0f32.powi(-(exp as i32))
@@ -1852,7 +2053,11 @@ impl Ac3Decoder {
                 for i in 0..LFE_COEFS {
                     lfe_coeffs[i] = ab.lfemant[i];
                 }
-                self.imdcts[lfe_ch].process256(&lfe_coeffs, &mut self.samples[lfe_ch], blk * BLOCK_SAMPLES);
+                self.imdcts[lfe_ch].process256(
+                    &lfe_coeffs,
+                    &mut self.samples[lfe_ch],
+                    blk * BLOCK_SAMPLES,
+                );
             }
         }
 
@@ -1861,7 +2066,10 @@ impl Ac3Decoder {
 
     /// Generate a dither value for bap=0 coefficients.
     fn dither(&mut self) -> f32 {
-        self.dither_state = self.dither_state.wrapping_mul(1103515245).wrapping_add(12345);
+        self.dither_state = self
+            .dither_state
+            .wrapping_mul(1103515245)
+            .wrapping_add(12345);
         let val = (self.dither_state >> 16) as i16;
         val as f32 / 32768.0 * 0.707 // sqrt(2)/2 ≈ -3dB
     }
@@ -2018,7 +2226,9 @@ fn bit_allocation(
             j += 1;
         }
         k += 1;
-        if end <= lastbin { break; }
+        if end <= lastbin {
+            break;
+        }
     }
 
     // Step 3: Excitation function
@@ -2035,7 +2245,9 @@ fn bit_allocation(
         begin = 7;
 
         for bin in 2..7 {
-            if bin >= bndend { break; }
+            if bin >= bndend {
+                break;
+            }
             if bndend != 7 || bin != 6 {
                 lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
             }
@@ -2108,7 +2320,9 @@ fn bit_allocation(
         let lastbin = (BNDTAB[j] as usize + BNDSZ[j] as usize).min(end);
         mask[j] -= snroffset;
         mask[j] -= ba.floor;
-        if mask[j] < 0 { mask[j] = 0; }
+        if mask[j] < 0 {
+            mask[j] = 0;
+        }
         mask[j] &= 0x1FE0;
         mask[j] += ba.floor;
 
@@ -2119,7 +2333,9 @@ fn bit_allocation(
             i += 1;
         }
         j += 1;
-        if end <= lastbin { break; }
+        if end <= lastbin {
+            break;
+        }
     }
 
     // Zero unused
@@ -2144,7 +2360,7 @@ struct MantissaReader {
 impl MantissaReader {
     fn new() -> Self {
         Self {
-            bap1_ptr: 3,  // force read on first use
+            bap1_ptr: 3, // force read on first use
             bap1_vals: [0.0; 3],
             bap2_ptr: 3,
             bap2_vals: [0.0; 3],
@@ -2234,8 +2450,10 @@ mod tests {
     #[test]
     fn frame_size_ac3() {
         let mut data = [0u8; 8];
-        data[0] = 0x0B; data[1] = 0x77;
-        data[2] = 0x00; data[3] = 0x00;
+        data[0] = 0x0B;
+        data[1] = 0x77;
+        data[2] = 0x00;
+        data[3] = 0x00;
         data[4] = 0x0C; // fscod=0, frmsizecod=12
         data[5] = 0x40; // bsid=8
         let result = Ac3Decoder::frame_size(&data);
@@ -2325,13 +2543,13 @@ mod tests {
         // strmtyp=00, substreamid=000, frmsiz[10:0]=10111111111
         data[2] = 0x05; // 00_000_101
         data[3] = 0xFF; // 11111111
-        // fscod=00, numblkscod=11, acmod=111, lfeon=1
+                        // fscod=00, numblkscod=11, acmod=111, lfeon=1
         data[4] = 0x3F; // 00_11_111_1
-        // bsid=10000, dialnorm=00101
+                        // bsid=10000, dialnorm=00101
         data[5] = 0x85; // 10000_001
         data[6] = 0x01; // 01_......  (dialnorm continues, then compre=0)
-        // Remaining bytes zero = compre=0, dual_mono=no (acmod=7 != 0),
-        // All subsequent flags will be 0 (no optional metadata).
+                        // Remaining bytes zero = compre=0, dual_mono=no (acmod=7 != 0),
+                        // All subsequent flags will be 0 (no optional metadata).
 
         let decoder = Ac3Decoder::new();
         let mut br = BitReader::new(&data);

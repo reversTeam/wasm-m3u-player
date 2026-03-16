@@ -1,6 +1,6 @@
+use std::cell::Cell;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::rc::Rc;
-use std::cell::Cell;
 
 use crate::types::*;
 
@@ -295,7 +295,9 @@ impl Mp4Demuxer {
                     break; // Not enough data for extended header
                 }
                 let ext = &data[(i + 8)..(i + 16)];
-                u64::from_be_bytes([ext[0], ext[1], ext[2], ext[3], ext[4], ext[5], ext[6], ext[7]])
+                u64::from_be_bytes([
+                    ext[0], ext[1], ext[2], ext[3], ext[4], ext[5], ext[6], ext[7],
+                ])
             } else if size_u32 == 0 {
                 // Box extends to EOF
                 0
@@ -362,15 +364,7 @@ impl Mp4Demuxer {
         match mp4_track.media_type() {
             Ok(mp4::MediaType::H264) => {
                 // Try to get avcC for precise codec string
-                if let Some(avc1) = mp4_track
-                    .trak
-                    .mdia
-                    .minf
-                    .stbl
-                    .stsd
-                    .avc1
-                    .as_ref()
-                {
+                if let Some(avc1) = mp4_track.trak.mdia.minf.stbl.stsd.avc1.as_ref() {
                     let avcc = &avc1.avcc;
                     format!(
                         "avc1.{:02X}{:02X}{:02X}",
@@ -514,11 +508,7 @@ impl Mp4Demuxer {
                 }
 
                 // Compute timestamp in microseconds from stts
-                let timestamp_us = Self::compute_sample_time_us(
-                    track,
-                    sample_id,
-                    timescale,
-                );
+                let timestamp_us = Self::compute_sample_time_us(track, sample_id, timescale);
 
                 // Compute absolute byte offset from stsc + stco/co64 + stsz
                 if let Some(byte_offset) = Self::compute_sample_offset(track, sample_id) {
@@ -540,11 +530,7 @@ impl Mp4Demuxer {
     ///
     /// Walks the stts (decoding time-to-sample) table to accumulate
     /// elapsed time up to the given sample_id (1-based).
-    fn compute_sample_time_us(
-        track: &mp4::Mp4Track,
-        sample_id: u32,
-        timescale: u32,
-    ) -> i64 {
+    fn compute_sample_time_us(track: &mp4::Mp4Track, sample_id: u32, timescale: u32) -> i64 {
         let mut elapsed: u64 = 0;
         let mut current_sample: u32 = 1;
 
@@ -600,8 +586,7 @@ impl Mp4Demuxer {
         }?;
 
         // Compute intra-chunk offset: sum sizes of preceding samples in this chunk
-        let first_sample_in_chunk =
-            sample_id - (sample_id - first_sample) % samples_per_chunk;
+        let first_sample_in_chunk = sample_id - (sample_id - first_sample) % samples_per_chunk;
 
         let stsz = &stbl.stsz;
         let mut intra_offset: u64 = 0;
@@ -883,7 +868,7 @@ mod tests {
     fn scan_multiple_boxes() {
         let mut data = make_box(b"ftyp", 12); // 20 bytes
         data.extend(make_box(b"moov", 100)); // 108 bytes
-        data.extend(make_box(b"mdat", 50));  // 58 bytes
+        data.extend(make_box(b"mdat", 50)); // 58 bytes
         let boxes = Mp4Demuxer::scan_top_level_boxes(&data);
         assert_eq!(boxes.len(), 3);
         assert!(boxes[0].is_type(b"ftyp"));
@@ -991,7 +976,7 @@ mod tests {
     #[test]
     fn locate_moov_at_end() {
         // ftyp + mdat only — moov missing in scanned data
-        let mut data = make_box(b"ftyp", 12);   // 20 bytes
+        let mut data = make_box(b"ftyp", 12); // 20 bytes
         data.extend(make_box(b"mdat", 10000)); // 10008 bytes
         let file_size = 20000u64; // file is larger — moov at end
         match Mp4Demuxer::locate_moov(&data, file_size) {
@@ -1038,8 +1023,8 @@ mod tests {
     #[test]
     fn locate_moov_mdat_end_equals_file_size() {
         // mdat fills the rest of the file — no room for moov
-        let mut data = make_box(b"ftyp", 4);  // 12 bytes
-        data.extend(make_box(b"mdat", 0));   // 8 bytes
+        let mut data = make_box(b"ftyp", 4); // 12 bytes
+        data.extend(make_box(b"mdat", 0)); // 8 bytes
         let file_size = 20u64;
         match Mp4Demuxer::locate_moov(&data, file_size) {
             MoovLocation::Unknown => {}
@@ -1062,8 +1047,7 @@ mod tests {
     #[test]
     fn mp4_probe_valid_ftyp() {
         let data = [
-            0x00, 0x00, 0x00, 0x1C, b'f', b't', b'y', b'p',
-            b'i', b's', b'o', b'm',
+            0x00, 0x00, 0x00, 0x1C, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm',
         ];
         assert!(Mp4Demuxer::probe(&data));
     }
@@ -1075,20 +1059,22 @@ mod tests {
 
     #[test]
     fn mp4_probe_too_short() {
-        assert!(!Mp4Demuxer::probe(&[0x00, 0x00, 0x00, 0x1C, b'f', b't', b'y']));
+        assert!(!Mp4Demuxer::probe(&[
+            0x00, 0x00, 0x00, 0x1C, b'f', b't', b'y'
+        ]));
     }
 
     #[test]
     fn mp4_probe_wrong_type() {
-        let data = [
-            0x00, 0x00, 0x00, 0x1C, b'm', b'o', b'o', b'v',
-        ];
+        let data = [0x00, 0x00, 0x00, 0x1C, b'm', b'o', b'o', b'v'];
         assert!(!Mp4Demuxer::probe(&data));
     }
 
     #[test]
     fn mp4_probe_mkv_magic() {
-        assert!(!Mp4Demuxer::probe(&[0x1A, 0x45, 0xDF, 0xA3, 0x93, 0x42, 0x86, 0x81]));
+        assert!(!Mp4Demuxer::probe(&[
+            0x1A, 0x45, 0xDF, 0xA3, 0x93, 0x42, 0x86, 0x81
+        ]));
     }
 
     // =============================================
@@ -1143,8 +1129,7 @@ mod tests {
         let mut d = Mp4Demuxer::new();
         // Valid ftyp header but truncated
         let data = [
-            0x00, 0x00, 0x00, 0x1C, b'f', b't', b'y', b'p',
-            b'i', b's', b'o', b'm',
+            0x00, 0x00, 0x00, 0x1C, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm',
         ];
         let result = d.parse_header(&data);
         assert!(result.is_err());
@@ -1188,11 +1173,11 @@ mod tests {
     #[test]
     fn locate_moov_multiple_mdat_before_moov() {
         // ftyp + mdat + free + moov (moov found despite mdat before it)
-        let mut data = make_box(b"ftyp", 12);  // 20 bytes
-        data.extend(make_box(b"mdat", 100));    // 108 bytes
-        data.extend(make_box(b"free", 8));      // 16 bytes
+        let mut data = make_box(b"ftyp", 12); // 20 bytes
+        data.extend(make_box(b"mdat", 100)); // 108 bytes
+        data.extend(make_box(b"free", 8)); // 16 bytes
         let moov_offset = data.len();
-        data.extend(make_box(b"moov", 200));    // 208 bytes
+        data.extend(make_box(b"moov", 200)); // 208 bytes
         let file_size = data.len() as u64;
         match Mp4Demuxer::locate_moov(&data, file_size) {
             MoovLocation::Found { offset, .. } => {
@@ -1206,7 +1191,7 @@ mod tests {
     fn locate_moov_with_extended_mdat() {
         // ftyp + extended-size mdat — moov at end
         let mut data = make_box(b"ftyp", 12); // 20 bytes
-        // mdat with extended 64-bit size
+                                              // mdat with extended 64-bit size
         data.extend(make_box_extended(b"mdat", 64)); // 64 bytes
         let file_size = 1000u64;
         match Mp4Demuxer::locate_moov(&data, file_size) {
@@ -1260,9 +1245,9 @@ mod tests {
 
     #[test]
     fn scan_box_chain_with_extended_in_middle() {
-        let mut data = make_box(b"ftyp", 4);           // 12 bytes
-        data.extend(make_box_extended(b"mdat", 32));     // 32 bytes
-        data.extend(make_box(b"moov", 8));               // 16 bytes
+        let mut data = make_box(b"ftyp", 4); // 12 bytes
+        data.extend(make_box_extended(b"mdat", 32)); // 32 bytes
+        data.extend(make_box(b"moov", 8)); // 16 bytes
         let boxes = Mp4Demuxer::scan_top_level_boxes(&data);
         assert_eq!(boxes.len(), 3);
         assert!(boxes[0].is_type(b"ftyp"));

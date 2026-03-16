@@ -129,7 +129,10 @@ impl SeekIndex {
         }
 
         // Binary search: find the rightmost entry with timestamp_us <= target
-        match self.entries.binary_search_by_key(&timestamp_us, |e| e.timestamp_us) {
+        match self
+            .entries
+            .binary_search_by_key(&timestamp_us, |e| e.timestamp_us)
+        {
             // Exact match
             Ok(idx) => Some(&self.entries[idx]),
             // insertion point — the entry before it is the one we want
@@ -271,12 +274,7 @@ mod tests {
 
     #[test]
     fn lookup_exact_match() {
-        let entries = make_entries(&[
-            (0, 0),
-            (2_000_000, 200),
-            (4_000_000, 400),
-            (6_000_000, 600),
-        ]);
+        let entries = make_entries(&[(0, 0), (2_000_000, 200), (4_000_000, 400), (6_000_000, 600)]);
         let idx = SeekIndex::from_entries(entries);
         let result = idx.lookup_keyframe(4_000_000).unwrap();
         assert_eq!(result.timestamp_us, 4_000_000);
@@ -285,12 +283,7 @@ mod tests {
 
     #[test]
     fn lookup_between_entries_returns_previous() {
-        let entries = make_entries(&[
-            (0, 0),
-            (2_000_000, 200),
-            (4_000_000, 400),
-            (6_000_000, 600),
-        ]);
+        let entries = make_entries(&[(0, 0), (2_000_000, 200), (4_000_000, 400), (6_000_000, 600)]);
         let idx = SeekIndex::from_entries(entries);
 
         // Between 2s and 4s → returns 2s entry
@@ -359,9 +352,18 @@ mod tests {
 
     #[test]
     fn seek_entry_equality() {
-        let a = SeekEntry { timestamp_us: 100, byte_offset: 200 };
-        let b = SeekEntry { timestamp_us: 100, byte_offset: 200 };
-        let c = SeekEntry { timestamp_us: 100, byte_offset: 300 };
+        let a = SeekEntry {
+            timestamp_us: 100,
+            byte_offset: 200,
+        };
+        let b = SeekEntry {
+            timestamp_us: 100,
+            byte_offset: 200,
+        };
+        let c = SeekEntry {
+            timestamp_us: 100,
+            byte_offset: 300,
+        };
         assert_eq!(a, b);
         assert_ne!(a, c);
     }

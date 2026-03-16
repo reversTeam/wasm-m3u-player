@@ -12,8 +12,7 @@ pub fn detect_format(data: &[u8]) -> ContainerFormat {
     }
 
     // MKV/WebM: EBML header 0x1A45DFA3
-    if data.len() >= 4 && data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3
-    {
+    if data.len() >= 4 && data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3 {
         // Could distinguish MKV vs WebM via DocType, but for now treat as Mkv
         return ContainerFormat::Mkv;
     }

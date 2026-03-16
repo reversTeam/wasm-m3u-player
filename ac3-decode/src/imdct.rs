@@ -7,9 +7,9 @@ use crate::tables::WINDOW;
 use std::f64::consts::PI;
 
 const N: usize = 512;
-const N2: usize = N / 2;   // 256
-const N4: usize = N / 4;   // 128
-const N8: usize = N / 8;   // 64
+const N2: usize = N / 2; // 256
+const N4: usize = N / 4; // 128
+const N8: usize = N / 8; // 64
 
 /// IMDCT processor with per-channel delay buffer.
 pub struct Imdct {
@@ -50,8 +50,16 @@ impl Imdct {
         for k in 0..N4 {
             // Z[k] = coeffs[N/2-1-2k] * xcos1[k] - coeffs[2k] * xsin1[k]  (real)
             //      + j*(coeffs[2k] * xcos1[k] + coeffs[N/2-1-2k] * xsin1[k])  (imag)
-            let c_even = if 2 * k < coeffs.len() { coeffs[2 * k] } else { 0.0 };
-            let c_odd = if N2 - 1 - 2 * k < coeffs.len() { coeffs[N2 - 1 - 2 * k] } else { 0.0 };
+            let c_even = if 2 * k < coeffs.len() {
+                coeffs[2 * k]
+            } else {
+                0.0
+            };
+            let c_odd = if N2 - 1 - 2 * k < coeffs.len() {
+                coeffs[N2 - 1 - 2 * k]
+            } else {
+                0.0
+            };
 
             z_re[k] = c_odd * self.xcos1[k] - c_even * self.xsin1[k];
             z_im[k] = c_even * self.xcos1[k] + c_odd * self.xsin1[k];
@@ -72,20 +80,20 @@ impl Imdct {
         let mut x256 = [0.0f32; N];
         for n in 0..N8 {
             // Quadrant 1: x[0..N/4]
-            x256[2 * n]     = -y_im[N8 + n]         * WINDOW[2 * n];
-            x256[2 * n + 1] =  y_re[N8 - n - 1]     * WINDOW[2 * n + 1];
+            x256[2 * n] = -y_im[N8 + n] * WINDOW[2 * n];
+            x256[2 * n + 1] = y_re[N8 - n - 1] * WINDOW[2 * n + 1];
 
             // Quadrant 2: x[N/4..N/2]
-            x256[N4 + 2 * n]     = -y_re[n]              * WINDOW[N4 + 2 * n];
-            x256[N4 + 2 * n + 1] =  y_im[N4 - n - 1]     * WINDOW[N4 + 2 * n + 1];
+            x256[N4 + 2 * n] = -y_re[n] * WINDOW[N4 + 2 * n];
+            x256[N4 + 2 * n + 1] = y_im[N4 - n - 1] * WINDOW[N4 + 2 * n + 1];
 
             // Quadrant 3: x[N/2..3N/4]
-            x256[N2 + 2 * n]     = -y_re[N8 + n]         * WINDOW[N2 - 2 * n - 1];
-            x256[N2 + 2 * n + 1] =  y_im[N8 - n - 1]     * WINDOW[N2 - 2 * n - 2];
+            x256[N2 + 2 * n] = -y_re[N8 + n] * WINDOW[N2 - 2 * n - 1];
+            x256[N2 + 2 * n + 1] = y_im[N8 - n - 1] * WINDOW[N2 - 2 * n - 2];
 
             // Quadrant 4: x[3N/4..N]
-            x256[3 * N4 + 2 * n]     =  y_im[n]              * WINDOW[N4 - 2 * n - 1];
-            x256[3 * N4 + 2 * n + 1] = -y_re[N4 - n - 1]     * WINDOW[N4 - 2 * n - 2];
+            x256[3 * N4 + 2 * n] = y_im[n] * WINDOW[N4 - 2 * n - 1];
+            x256[3 * N4 + 2 * n + 1] = -y_re[N4 - n - 1] * WINDOW[N4 - 2 * n - 2];
         }
 
         // Step 5: Overlap-add with delay, scale by 128, clip to [-1, 1]

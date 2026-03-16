@@ -155,11 +155,7 @@ impl AudioPipeline {
     /// Decode an encoded audio chunk from the demuxer.
     pub fn decode(&mut self, chunk: &EncodedChunk) -> Result<(), JsValue> {
         match &mut self.backend {
-            Some(AudioBackend::WebCodecs {
-                decoder,
-                error,
-                ..
-            }) => {
+            Some(AudioBackend::WebCodecs { decoder, error, .. }) => {
                 if let Some(err) = error.borrow().as_ref() {
                     return Err(JsValue::from_str(&format!("Audio decoder error: {}", err)));
                 }
@@ -220,15 +216,21 @@ impl AudioPipeline {
                         // Log first few errors, then suppress to avoid flooding console
                         *error_count += 1;
                         if *error_count <= 3 {
-                            let hex: String = chunk.data.iter().take(12)
+                            let hex: String = chunk
+                                .data
+                                .iter()
+                                .take(12)
                                 .map(|b| format!("{:02x}", b))
                                 .collect::<Vec<_>>()
                                 .join(" ");
                             web_sys::console::log_1(
                                 &format!(
                                     "[audio-sw] decode error: {} (len={}, head={})",
-                                    e, chunk.data.len(), hex
-                                ).into(),
+                                    e,
+                                    chunk.data.len(),
+                                    hex
+                                )
+                                .into(),
                             );
                             if *error_count == 3 {
                                 web_sys::console::log_1(
@@ -277,7 +279,9 @@ impl AudioPipeline {
             self.next_play_time = ctx.current_time();
 
             // Save current volume before disconnecting
-            let current_volume = self.gain_node.as_ref()
+            let current_volume = self
+                .gain_node
+                .as_ref()
                 .map(|g| g.gain().value())
                 .unwrap_or(1.0);
 
@@ -311,12 +315,16 @@ impl AudioPipeline {
         let pending = match &mut self.backend {
             Some(AudioBackend::WebCodecs { data_queue, .. }) => {
                 let items: Vec<_> = data_queue.borrow_mut().drain(..).collect();
-                if items.is_empty() { return Ok(()); }
+                if items.is_empty() {
+                    return Ok(());
+                }
                 Pending::WebCodecs(items)
             }
             Some(AudioBackend::Software { pcm_queue, .. }) => {
                 let items: Vec<_> = pcm_queue.drain(..).collect();
-                if items.is_empty() { return Ok(()); }
+                if items.is_empty() {
+                    return Ok(());
+                }
                 Pending::Software(items)
             }
             None => return Ok(()),
@@ -340,7 +348,11 @@ impl AudioPipeline {
     }
 
     /// Schedule WebCodecs AudioData for playback.
-    fn schedule_audio_data(&mut self, ctx: &AudioContext, audio_data: &AudioData) -> Result<(), JsValue> {
+    fn schedule_audio_data(
+        &mut self,
+        ctx: &AudioContext,
+        audio_data: &AudioData,
+    ) -> Result<(), JsValue> {
         let sample_rate = audio_data.sample_rate() as f32;
         let num_channels = audio_data.number_of_channels();
         let num_frames = audio_data.number_of_frames();
@@ -473,7 +485,11 @@ impl AudioPipeline {
     /// Use this during seek to preserve `currentTime` continuity.
     pub fn close_decoder(&mut self) {
         match self.backend.take() {
-            Some(AudioBackend::WebCodecs { decoder, data_queue, .. }) => {
+            Some(AudioBackend::WebCodecs {
+                decoder,
+                data_queue,
+                ..
+            }) => {
                 let _ = decoder.close();
                 for data in data_queue.borrow_mut().drain(..) {
                     data.close();

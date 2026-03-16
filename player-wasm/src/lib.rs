@@ -1,12 +1,12 @@
 use wasm_bindgen::prelude::*;
 
+pub mod audio;
 pub mod buffer;
 pub mod decoder;
-pub mod renderer;
 pub mod fetch;
-pub mod audio;
-pub mod sync;
 pub mod player;
+pub mod renderer;
+pub mod sync;
 
 /// Initialize the WASM module (sets up panic hook for better error messages).
 #[wasm_bindgen(start)]

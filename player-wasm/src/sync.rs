@@ -121,7 +121,8 @@ impl AVSync {
 
     /// Get current dynamic sync threshold for debugging.
     pub fn threshold_ms(&self) -> f64 {
-        self.last_duration_ms.clamp(AV_SYNC_THRESHOLD_MIN_MS, AV_SYNC_THRESHOLD_MAX_MS)
+        self.last_duration_ms
+            .clamp(AV_SYNC_THRESHOLD_MIN_MS, AV_SYNC_THRESHOLD_MAX_MS)
     }
 
     /// Core sync decision — call for each frame in the decoded queue.
@@ -230,7 +231,12 @@ impl AVSync {
 
     /// Get sync statistics: (rendered, dropped, held, skipped).
     pub fn stats(&self) -> (u64, u64, u64, u64) {
-        (self.frames_rendered, self.frames_dropped, self.frames_held, self.frames_skipped)
+        (
+            self.frames_rendered,
+            self.frames_dropped,
+            self.frames_held,
+            self.frames_skipped,
+        )
     }
 
     /// Reset all sync state (after seek).
@@ -345,8 +351,12 @@ mod tests {
             let pts = i as f64 * 41.67;
             last_action = sync.decide(pts, 5000.0, 5000.0);
             if last_action == SyncAction::SkipToKeyframe {
-                assert!(i >= MAX_RENDERS_WITHOUT_HOLD as i32 - 1,
-                    "skip at frame {} (expected around {})", i, MAX_RENDERS_WITHOUT_HOLD);
+                assert!(
+                    i >= MAX_RENDERS_WITHOUT_HOLD as i32 - 1,
+                    "skip at frame {} (expected around {})",
+                    i,
+                    MAX_RENDERS_WITHOUT_HOLD
+                );
                 return;
             }
         }
@@ -375,8 +385,8 @@ mod tests {
     #[test]
     fn test_stats() {
         let mut sync = make_sync_24fps();
-        sync.decide(0.0, 0.0, 0.0);         // Render
-        sync.decide(41.67, 5.0, 5.0);        // Hold (too early)
+        sync.decide(0.0, 0.0, 0.0); // Render
+        sync.decide(41.67, 5.0, 5.0); // Hold (too early)
 
         let (rendered, _dropped, held, _skipped) = sync.stats();
         assert_eq!(rendered, 1);

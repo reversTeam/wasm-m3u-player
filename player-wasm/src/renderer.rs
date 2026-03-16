@@ -33,8 +33,7 @@ impl CanvasRenderer {
         }
 
         // drawImage with VideoFrame — zero-copy GPU transfer
-        self.context
-            .draw_image_with_video_frame(frame, 0.0, 0.0)?;
+        self.context.draw_image_with_video_frame(frame, 0.0, 0.0)?;
 
         Ok(())
     }

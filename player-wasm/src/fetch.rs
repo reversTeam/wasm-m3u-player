@@ -1,6 +1,6 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Request, RequestInit, RequestMode, ReadableStreamDefaultReader, Response};
+use web_sys::{ReadableStreamDefaultReader, Request, RequestInit, RequestMode, Response};
 
 /// Information from an HTTP HEAD / probe request.
 pub struct HeadInfo {
@@ -25,7 +25,11 @@ pub struct StreamReader {
 }
 
 /// Send a fetch request and return the response (shared helper).
-async fn do_fetch(url: &str, method: &str, range_header: Option<&str>) -> Result<Response, JsValue> {
+async fn do_fetch(
+    url: &str,
+    method: &str,
+    range_header: Option<&str>,
+) -> Result<Response, JsValue> {
     let opts = RequestInit::new();
     opts.set_method(method);
     opts.set_mode(RequestMode::Cors);
@@ -107,7 +111,9 @@ impl StreamReader {
             .flatten()
             .and_then(|cr| {
                 // Format: "bytes 0-65535/123456789"
-                cr.split('/').last().and_then(|s| s.trim().parse::<u64>().ok())
+                cr.split('/')
+                    .last()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
             })
             .unwrap_or_else(|| {
                 // Fallback to Content-Length (for 200 responses)
