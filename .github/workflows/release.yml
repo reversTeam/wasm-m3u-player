@@ -33,8 +33,10 @@ jobs:
 
       - name: Set package version
         run: |
-          # Update Cargo.toml version
-          sed -i "s/^version = \".*\"/version = \"${{ steps.version.outputs.VERSION }}\"/" player-wasm/Cargo.toml
+          # Update only the [package] version (line 3), not dependency versions like web-sys
+          sed -i '3s/^version = ".*"/version = "${{ steps.version.outputs.VERSION }}"/' player-wasm/Cargo.toml
+          echo "Updated version:" && head -4 player-wasm/Cargo.toml
+          echo "web-sys unchanged:" && grep -A1 'dependencies.web-sys' player-wasm/Cargo.toml
 
       - name: Build WASM package
         run: wasm-pack build player-wasm/ --target web --out-dir ../www/pkg --out-name player
