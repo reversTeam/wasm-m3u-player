@@ -298,7 +298,6 @@ export class PlayerControls {
     /** Signal that a seek operation completed — unlocks the seek bar.
      *  Call this from the Seeked event handler. */
     seekComplete() {
-        console.log('[controls] seekComplete, was seeking=', this._seeking);
         this._seeking = false;
     }
 

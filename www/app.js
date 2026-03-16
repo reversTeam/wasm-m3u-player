@@ -146,11 +146,6 @@ function handlePlayerEvent(event) {
         case 'TimeUpdate':
             if (event.current_ms != null && controls) {
                 controls.updateTime(event.current_ms);
-                // Debug: log first 3 TimeUpdates after seek
-                if (controls._seekDebug > 0) {
-                    console.log('[app] TimeUpdate after seek:', event.current_ms, 'seeking=', controls._seeking);
-                    controls._seekDebug--;
-                }
             }
             break;
 
@@ -178,7 +173,6 @@ function handlePlayerEvent(event) {
         }
 
         case 'VideoResized':
-            console.log(`Video resized: ${event.width}\u00d7${event.height}`);
             break;
 
         case 'Error':
@@ -194,7 +188,6 @@ function handlePlayerEvent(event) {
             break;
 
         case 'Seeked':
-            console.log('[app] Seeked event, actual_ms=', event.actual_ms);
             if (controls) {
                 controls.hideMessage();
                 controls.seekComplete();
@@ -216,7 +209,7 @@ function handlePlayerEvent(event) {
             break;
 
         default:
-            console.log('Player event:', event);
+            break;
     }
 }
 
@@ -287,10 +280,7 @@ function setupControls() {
     controls.on('seek', async ({ targetMs }) => {
         if (!player) return;
         try {
-            console.log('[app] Seek requested to', targetMs, 'ms');
-            controls._seekDebug = 5; // log next 5 TimeUpdates
             await player.seek(BigInt(targetMs));
-            console.log('[app] Seek promise resolved, status=', currentStatus);
             if (currentStatus === 'Playing' || currentStatus === 'Buffering') {
                 startRenderLoop();
             }
