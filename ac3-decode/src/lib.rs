@@ -69,6 +69,21 @@ const EAC3_REDUCED_SAMPLE_RATES: [u32; 4] = [24000, 22050, 16000, 0];
 /// Number of blocks lookup from numblkscod.
 const EAC3_BLOCKS: [usize; 4] = [1, 2, 3, 6];
 
+/// E-AC-3 frame exponent strategy LUT — maps 5-bit code to per-block strategies.
+/// From FFmpeg eac3_data.c ff_eac3_frm_expstr[32][6].
+/// Block 0 always has new exponents (D15=1). Bits 4..0 encode blocks 1-5:
+/// bit=0 → new (1), bit=1 → reuse (0). Bit 4=block1, bit 0=block5.
+const EAC3_FRM_EXPSTR: [[u8; 6]; 32] = [
+    [1,1,1,1,1,1],[1,1,1,1,1,0],[1,1,1,1,0,1],[1,1,1,1,0,0],
+    [1,1,1,0,1,1],[1,1,1,0,1,0],[1,1,1,0,0,1],[1,1,1,0,0,0],
+    [1,1,0,1,1,1],[1,1,0,1,1,0],[1,1,0,1,0,1],[1,1,0,1,0,0],
+    [1,1,0,0,1,1],[1,1,0,0,1,0],[1,1,0,0,0,1],[1,1,0,0,0,0],
+    [1,0,1,1,1,1],[1,0,1,1,1,0],[1,0,1,1,0,1],[1,0,1,1,0,0],
+    [1,0,1,0,1,1],[1,0,1,0,1,0],[1,0,1,0,0,1],[1,0,1,0,0,0],
+    [1,0,0,1,1,1],[1,0,0,1,1,0],[1,0,0,1,0,1],[1,0,0,1,0,0],
+    [1,0,0,0,1,1],[1,0,0,0,1,0],[1,0,0,0,0,1],[1,0,0,0,0,0],
+];
+
 /// Parsed E-AC-3 BSI (Bit Stream Information) — frame-level parameters.
 /// E-AC-3 differs from AC-3: exponent strategies, coupling flags, SNR offsets,
 /// block switch, and dither are all stored at the frame level in the BSI,
@@ -94,40 +109,30 @@ struct EacBsi {
     cmixlev: usize,     // center downmix level
     surmixlev: usize,   // surround downmix level
 
+    // --- audfrm syntax flags (per FFmpeg ff_eac3_parse_header) ---
+    block_switch_syntax: bool,  // if false: no blksw in audio blocks
+    dither_flag_syntax: bool,   // if false: dither always ON
+    bit_allocation_syntax: bool,// if false: use default BA params
+    fast_gain_syntax: bool,     // if false: no fast gain in audio blocks
+    dba_syntax: bool,           // if false: no delta BA in audio blocks
+    skip_syntax: bool,          // if false: no skip field in audio blocks
+    snr_offset_strategy: u8,    // 0=frame-level, 1-3=per-block in audio block
+
+    // --- Coupling (frame-level flags) ---
+    cpl_strategy_exists: [bool; EAC3_MAX_BLOCKS],
+    cplinu: [bool; EAC3_MAX_BLOCKS],
+
     // --- Frame-level exponent strategies (audfrm) ---
     // [ch][blk] for channels, [blk] for coupling/LFE
     chexpstr: [[u8; EAC3_MAX_BLOCKS]; MAX_CHANNELS],
     cplexpstr: [u8; EAC3_MAX_BLOCKS],
     lfeexpstr: [u8; EAC3_MAX_BLOCKS],
 
-    // --- Block switch and dither (frame-level in E-AC-3) ---
-    blksw: [[bool; EAC3_MAX_BLOCKS]; MAX_CHANNELS],
-    dithflag: [[bool; EAC3_MAX_BLOCKS]; MAX_CHANNELS],
+    // --- SNR offset (when snr_offset_strategy == 0, shared for all) ---
+    snr_offset: i32,
 
-    // --- Bit allocation params ---
-    baie: bool,
-    sdcycod: usize,
-    fdcycod: usize,
-    sgaincod: usize,
-    dbpbcod: usize,
-    floorcod: usize,
-
-    // --- SNR offsets (frame-level) ---
-    snroffste: bool,
-    csnroffst: i32,
-    blkfsnroffst: [i32; EAC3_MAX_BLOCKS],
-    fsnroffst: [i32; MAX_CHANNELS],
-    fgaincod: [usize; MAX_CHANNELS],
-    cplfsnroffst: i32,
-    cplfgaincod: usize,
-    lfefsnroffst: i32,
-    lfefgaincod: usize,
-
-    // --- Coupling (frame-level flags) ---
-    cplinu: [bool; EAC3_MAX_BLOCKS],
-
-    // --- Spectral extension (store flags, skip details for MVP) ---
-    spxinu: [bool; EAC3_MAX_BLOCKS],
+    // --- SPX attenuation codes ---
+    spx_atten_code: [i8; MAX_CHANNELS], // -1 = not set
 }
 
 impl EacBsi {
@@ -151,32 +156,23 @@ impl EacBsi {
             cmixlev: 0,
             surmixlev: 0,
 
+            block_switch_syntax: false,
+            dither_flag_syntax: false,
+            bit_allocation_syntax: false,
+            fast_gain_syntax: false,
+            dba_syntax: false,
+            skip_syntax: false,
+            snr_offset_strategy: 0,
+
+            cpl_strategy_exists: [false; EAC3_MAX_BLOCKS],
+            cplinu: [false; EAC3_MAX_BLOCKS],
+
             chexpstr: [[0; EAC3_MAX_BLOCKS]; MAX_CHANNELS],
             cplexpstr: [0; EAC3_MAX_BLOCKS],
             lfeexpstr: [0; EAC3_MAX_BLOCKS],
 
-            blksw: [[false; EAC3_MAX_BLOCKS]; MAX_CHANNELS],
-            dithflag: [[true; EAC3_MAX_BLOCKS]; MAX_CHANNELS],
-
-            baie: false,
-            sdcycod: 0,
-            fdcycod: 0,
-            sgaincod: 0,
-            dbpbcod: 0,
-            floorcod: 0,
-
-            snroffste: false,
-            csnroffst: 0,
-            blkfsnroffst: [0; EAC3_MAX_BLOCKS],
-            fsnroffst: [0; MAX_CHANNELS],
-            fgaincod: [0; MAX_CHANNELS],
-            cplfsnroffst: 0,
-            cplfgaincod: 0,
-            lfefsnroffst: 0,
-            lfefgaincod: 0,
-
-            cplinu: [false; EAC3_MAX_BLOCKS],
-            spxinu: [false; EAC3_MAX_BLOCKS],
+            snr_offset: 0,
+            spx_atten_code: [-1; MAX_CHANNELS],
         }
     }
 }
@@ -780,175 +776,155 @@ impl Ac3Decoder {
         let nfchans = eac.nfchans;
         let num_blocks = eac.num_blocks;
 
-        // --- Exponent strategies ---
-        if eac.numblkscod == 3 {
-            // 6-block mode: per-channel per-block exponent strategies
+        // ===== audfrm — per FFmpeg ff_eac3_parse_header =====
+        // The audfrm section has a COMPLETELY different structure from AC-3.
+        // It starts with syntax flags, then coupling, then exponent strategies.
+
+        let ac3_exponent_strategy;
+        let parse_aht_info;
+        if num_blocks == 6 {
+            ac3_exponent_strategy = br.read_bool(); // true = AC-3 style, false = LUT
+            parse_aht_info = br.read_bool();
+        } else {
+            ac3_exponent_strategy = true; // forced AC-3 style for < 6 blocks
+            parse_aht_info = false;
+        }
+
+        eac.snr_offset_strategy = br.read(2) as u8;
+        let _parse_transient_proc_info = br.read_bool();
+
+        eac.block_switch_syntax = br.read_bool();
+        eac.dither_flag_syntax = br.read_bool();
+        eac.bit_allocation_syntax = br.read_bool();
+        eac.fast_gain_syntax = br.read_bool();
+        eac.dba_syntax = br.read_bool();
+        eac.skip_syntax = br.read_bool();
+        let parse_spx_atten_data = br.read_bool();
+
+        // --- Coupling strategy per block ---
+        if eac.acmod > 1 { // multi-channel
             for blk in 0..num_blocks {
+                eac.cpl_strategy_exists[blk] = if blk == 0 { true } else { br.read_bool() };
+                if eac.cpl_strategy_exists[blk] {
+                    eac.cplinu[blk] = br.read_bool();
+                } else {
+                    eac.cplinu[blk] = if blk > 0 { eac.cplinu[blk - 1] } else { false };
+                }
+            }
+        }
+
+        // --- Exponent strategies ---
+        if ac3_exponent_strategy {
+            // AC-3 style: 2 bits per channel per block (includes coupling channel)
+            for blk in 0..num_blocks {
+                // If coupling is in use, first channel is coupling (ch=0 in FFmpeg)
+                if eac.cplinu[blk] {
+                    eac.cplexpstr[blk] = br.read(2) as u8;
+                }
                 for ch in 0..nfchans {
                     eac.chexpstr[ch][blk] = br.read(2) as u8;
                 }
             }
         } else {
-            // Fewer blocks: still per-channel per-block
-            for blk in 0..num_blocks {
-                for ch in 0..nfchans {
-                    eac.chexpstr[ch][blk] = br.read(2) as u8;
+            // LUT-based: 5 bits per channel maps to all 6 blocks
+            // Coupling channel (if any block uses coupling)
+            let num_cpl_blocks = eac.cplinu[..num_blocks].iter().filter(|&&c| c).count();
+            if eac.acmod > 1 && num_cpl_blocks > 0 {
+                let frmcplexpstr = br.read(5) as usize;
+                for blk in 0..6 {
+                    eac.cplexpstr[blk] = EAC3_FRM_EXPSTR[frmcplexpstr][blk];
+                }
+            }
+            for ch in 0..nfchans {
+                let frmchexpstr = br.read(5) as usize;
+                for blk in 0..6 {
+                    eac.chexpstr[ch][blk] = EAC3_FRM_EXPSTR[frmchexpstr][blk];
                 }
             }
         }
 
-        // ---- audfrm order per ETSI TS 102 366, E.1.3.1 ----
-        // 1. Exponent strategies (already parsed above)
-
-        // 2. Spectral extension strategy (MUST be before coupling)
-        // SPX strategy flags are frame-level. SPX band params and
-        // coordinates are read per audio block.
-        if eac.strmtyp == 0 {
-            for blk in 0..num_blocks {
-                if blk == 0 || br.read_bool() { // spxstre (blk 0 always signaled)
-                    eac.spxinu[blk] = br.read_bool();
-                    if eac.spxinu[blk] {
-                        // SPX band definition — only when SPX first turns on or strategy changes
-                        if blk == 0 || !eac.spxinu[blk.saturating_sub(1)] {
-                            // spxbegf(2), spxendf(3)
-                            let _spxbegf = br.read(2);
-                            let _spxendf = br.read(3);
-                        }
-                        // SPX band structure
-                        if blk == 0 || !eac.spxinu[blk.saturating_sub(1)] {
-                            // spxbndstrc per subband — but we need to know nspxbnds
-                            // For safety, read spxbndstrce if blk > 0
-                            if blk > 0 {
-                                let _spxbndstrce = br.read_bool();
-                                // If set, band structure bits follow — skip for MVP
-                            }
-                        }
-                        // SPX coordinates per channel
-                        for _ch in 0..nfchans {
-                            if br.read_bool() { // spxcoe
-                                // spxblnd(5) + per-band: spxcoexp(4) + spxcomant(4)
-                                // Number of bands is derived from spxbegf/spxendf
-                                // For MVP: we can't easily know nspxbnds without full parsing
-                                // This path should be rare for typical 5.1 content
-                                br.skip(5); // spxblnd
-                                // We'd need nspxbnds to know how many (exp,mant) pairs to read
-                                // For now, flag this as a potential issue
-                            }
-                        }
-                        // spxattene per channel
-                        for _ch in 0..nfchans {
-                            if br.read_bool() { // spxattene
-                                br.skip(5); // spxatten
-                            }
-                        }
-                    }
-                } else {
-                    eac.spxinu[blk] = if blk > 0 { eac.spxinu[blk - 1] } else { false };
-                }
-            }
-        }
-
-        // 3. Coupling in-use flags
-        eac.cplinu[0] = br.read_bool();
-        for blk in 1..num_blocks {
-            if br.read_bool() { // cplstre
-                eac.cplinu[blk] = br.read_bool();
-            } else {
-                eac.cplinu[blk] = eac.cplinu[blk - 1];
-            }
-        }
-
-        // 4. Coupling exponent strategy (for blocks where coupling is enabled)
-        for blk in 0..num_blocks {
-            if eac.cplinu[blk] {
-                eac.cplexpstr[blk] = br.read(2) as u8;
-            }
-        }
-
-        // 5. LFE exponent strategy
+        // LFE exponent strategy
         if eac.lfeon {
             for blk in 0..num_blocks {
                 eac.lfeexpstr[blk] = br.read(1) as u8;
             }
         }
 
-        // 5b. Converter exponent strategy (independent streams, non-6-block)
-        if eac.strmtyp == 0 && eac.numblkscod != 3 {
-            if br.read_bool() { // convexpstre
-                br.skip(5); // convexpstr
+        // Converter exponent strategies (original exponent strategies for converted streams)
+        if eac.strmtyp == 0 {
+            if num_blocks == 6 || br.read_bool() {
+                br.skip((5 * nfchans) as usize); // skip converter channel exponent strategy
             }
         }
 
-        // 6. Block switch flags
+        // --- AHT channel usage ---
+        if parse_aht_info {
+            // For AHT: all non-zero blocks must reuse exponents from first block
+            let num_cpl_blocks = eac.cplinu[..num_blocks].iter().filter(|&&c| c).count();
+            let start_ch = if num_cpl_blocks != 6 { 1 } else { 0 };
+            let total_channels = if eac.lfeon { nfchans + 1 } else { nfchans };
+            for ch in start_ch..=total_channels {
+                // Check if AHT can be used for this channel
+                let mut use_aht = true;
+                for blk in 1..6 {
+                    let exp_str = if ch == 0 {
+                        eac.cplexpstr[blk]
+                    } else if ch <= nfchans {
+                        eac.chexpstr[ch - 1][blk]
+                    } else {
+                        eac.lfeexpstr[blk]
+                    };
+                    if exp_str != 0 { // EXP_REUSE = 0
+                        use_aht = false;
+                        break;
+                    }
+                    if ch == 0 && eac.cpl_strategy_exists[blk] {
+                        use_aht = false;
+                        break;
+                    }
+                }
+                if use_aht {
+                    let _channel_uses_aht = br.read_bool();
+                }
+            }
+        }
+
+        // --- Per-frame SNR offset (when strategy == 0) ---
+        if eac.snr_offset_strategy == 0 {
+            let csnroffst = (br.read(6) as i32 - 15) << 4;
+            let snroffst = br.read(4) as i32;
+            eac.snr_offset = (csnroffst + snroffst) << 2;
+        }
+
+        // --- Transient pre-noise processing ---
+        if _parse_transient_proc_info {
+            for _ch in 0..nfchans {
+                if br.read_bool() { // channel in transient processing
+                    br.skip(10); // transient processing location
+                    br.skip(8);  // transient processing length
+                }
+            }
+        }
+
+        // --- SPX attenuation data ---
         for ch in 0..nfchans {
-            if br.read_bool() { // blkswe — per-channel enable
-                for blk in 0..num_blocks {
-                    eac.blksw[ch][blk] = br.read_bool();
-                }
+            if parse_spx_atten_data && br.read_bool() {
+                eac.spx_atten_code[ch] = br.read(5) as i8;
             } else {
-                for blk in 0..num_blocks {
-                    eac.blksw[ch][blk] = false;
-                }
+                eac.spx_atten_code[ch] = -1;
             }
         }
 
-        // 7. Dither flags
-        for ch in 0..nfchans {
-            if br.read_bool() { // dithflage — per-channel enable
-                for blk in 0..num_blocks {
-                    eac.dithflag[ch][blk] = br.read_bool();
-                }
-            } else {
-                // Default: dither ON for all blocks
-                for blk in 0..num_blocks {
-                    eac.dithflag[ch][blk] = true;
-                }
-            }
+        // --- Block start information ---
+        if num_blocks > 1 && br.read_bool() {
+            // nblkstrtbits = (numblks - 1) * (4 + ceil(log2(words_per_frame)))
+            let words_per_frame = eac.frmsize / 2;
+            let log2_wpf = if words_per_frame > 2 {
+                (words_per_frame - 2).next_power_of_two().trailing_zeros() as usize
+            } else { 0 };
+            let block_start_bits = (num_blocks - 1) * (4 + log2_wpf);
+            br.skip(block_start_bits);
         }
-
-        // 8. Bit allocation parametric info
-        eac.baie = br.read_bool();
-        if eac.baie {
-            eac.sdcycod = br.read(2) as usize;
-            eac.fdcycod = br.read(2) as usize;
-            eac.sgaincod = br.read(2) as usize;
-            eac.dbpbcod = br.read(2) as usize;
-            eac.floorcod = br.read(3) as usize;
-        }
-
-        // 9. SNR offset
-        eac.snroffste = br.read_bool();
-        if eac.snroffste {
-            eac.csnroffst = br.read(6) as i32;
-
-            // Per-block fine SNR offset (only for 6-block mode)
-            if eac.numblkscod == 3 {
-                for blk in 0..num_blocks {
-                    eac.blkfsnroffst[blk] = br.read(4) as i32;
-                }
-            }
-
-            // Per-channel fine SNR offset and gain
-            for ch in 0..nfchans {
-                eac.fsnroffst[ch] = br.read(4) as i32;
-                eac.fgaincod[ch] = br.read(3) as usize;
-            }
-
-            // Coupling SNR offset (if coupling used in any block)
-            let any_cpl = eac.cplinu[..num_blocks].iter().any(|&c| c);
-            if any_cpl {
-                eac.cplfsnroffst = br.read(4) as i32;
-                eac.cplfgaincod = br.read(3) as usize;
-            }
-
-            // LFE SNR offset
-            if eac.lfeon {
-                eac.lfefsnroffst = br.read(4) as i32;
-                eac.lfefgaincod = br.read(3) as usize;
-            }
-        }
-
-        // 10. AHT (Adaptive Hybrid Transform) — skip for MVP (bsid <= 16)
 
         Ok(eac)
     }
@@ -1389,40 +1365,80 @@ impl Ac3Decoder {
         let nfchans = eac_bsi.nfchans;
         let acmod = eac_bsi.acmod;
 
-        // 1. Block switch & dither — from BSI (already parsed at frame level)
-        for ch in 0..nfchans.min(MAX_CHANNELS) {
-            ab.blksw[ch] = eac_bsi.blksw[ch][blk];
-            ab.dithflag[ch] = eac_bsi.dithflag[ch][blk];
+        // 1. Block switch — conditional on syntax flag
+        if eac_bsi.block_switch_syntax {
+            for ch in 0..nfchans.min(MAX_CHANNELS) {
+                ab.blksw[ch] = br.read_bool();
+            }
+        } else {
+            for ch in 0..nfchans.min(MAX_CHANNELS) {
+                ab.blksw[ch] = false;
+            }
         }
 
-        // 2. Dynamic range compression (same as AC-3)
+        // 2. Dither — conditional on syntax flag
+        if eac_bsi.dither_flag_syntax {
+            for ch in 0..nfchans.min(MAX_CHANNELS) {
+                ab.dithflag[ch] = br.read_bool();
+            }
+        } else {
+            for ch in 0..nfchans.min(MAX_CHANNELS) {
+                ab.dithflag[ch] = true; // default: dither ON
+            }
+        }
+
+        // 3. Dynamic range compression (same as AC-3)
         if br.read_bool() { br.skip(8); }
         if acmod == 0x0 {
             if br.read_bool() { br.skip(8); }
         }
 
-        // 3. Spectral extension — skip for MVP
-        // If spxinu[blk] is set, SPX data would be in the block. For MVP we don't parse it.
-        // Most content doesn't use SPX, so this is acceptable for a first working decoder.
+        // 4. SPX — full parsing in audio block (E-AC-3 specific)
+        // SPX strategy + coordinates are per-block in E-AC-3
+        {
+            let spx_strategy_exists = if blk == 0 { true } else { br.read_bool() };
+            if spx_strategy_exists {
+                let spx_in_use = br.read_bool();
+                if spx_in_use {
+                    // SPX band definition
+                    if acmod == 1 {
+                        br.skip(1); // chinspx
+                    } else {
+                        for _ch in 0..nfchans.min(MAX_CHANNELS) {
+                            br.skip(1); // chinspx
+                        }
+                    }
+                    let spxstrtf = br.read(2) as usize;
+                    let spxbegf = spxstrtf * 2 + (if acmod == 1 { 5 } else { 3 });
+                    let spxendf = br.read(3) as usize + 1;
+                    // SPX band structure
+                    let nspxbnds = spxendf - spxbegf + 1;
+                    if br.read_bool() { // spxbndstrce (or first occurrence)
+                        for _bnd in 1..nspxbnds.min(18) {
+                            br.skip(1); // spxbndstrc
+                        }
+                    }
+                    // SPX coordinates per channel
+                    for _ch in 0..nfchans.min(MAX_CHANNELS) {
+                        if br.read_bool() { // spxcoe
+                            br.skip(5); // spxblnd
+                            br.skip(2); // mstrspxco
+                            // Per-band coordinates
+                            for _bnd in 0..nspxbnds.min(18) {
+                                br.skip(4); // spxcoexp
+                                br.skip(4); // spxcomant
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
-        // 4. Coupling strategy (E-AC-3 style)
-        // cplinu[blk] is known from BSI, but coupling PARAMETERS are still in the audio block.
-        if eac_bsi.cplinu[blk] {
-            // Determine if we need to read a new coupling strategy
-            let read_cpl_strategy = if blk == 0 {
-                // Block 0: always read full coupling strategy
-                true
-            } else if !eac_bsi.cplinu[blk.saturating_sub(1)] {
-                // Coupling just turned on — read strategy
-                true
-            } else {
-                // Coupling was on in previous block too — read cplstre flag
-                br.read_bool()
-            };
-
-            if read_cpl_strategy {
+        // 5. Coupling strategy
+        // cplinu[blk] and cpl_strategy_exists[blk] come from BSI audfrm
+        if eac_bsi.cpl_strategy_exists[blk] {
+            if eac_bsi.cplinu[blk] {
                 ab.cplinu = true;
-
                 for ch in 0..nfchans.min(MAX_CHANNELS) {
                     ab.chincpl[ch] = br.read_bool();
                 }
@@ -1434,7 +1450,9 @@ impl Ac3Decoder {
                 ab.cplendf = br.read(4) as usize;
 
                 if ab.cplendf + 3 < ab.cplbegf {
-                    return Err(DecodeError::BlockError("E-AC-3: cplendf < cplbegf".into()));
+                    return Err(DecodeError::BlockError(
+                        format!("E-AC-3: cplendf({}) < cplbegf({})-3", ab.cplendf, ab.cplbegf),
+                    ));
                 }
                 ab.ncplsubnd = 3 + ab.cplendf - ab.cplbegf;
                 if ab.ncplsubnd > 18 {
@@ -1449,16 +1467,15 @@ impl Ac3Decoder {
                     if ab.cplbndstrc[bnd] { ab.ncplbnd -= 1; }
                 }
             } else {
-                // Reuse previous coupling strategy
-                ab.cplinu = true;
-            }
-        } else {
-            if ab.cplinu {
-                // Coupling was active, now disabled
                 ab.cplinu = false;
                 for ch in 0..nfchans.min(MAX_CHANNELS) {
                     ab.chincpl[ch] = false;
                 }
+            }
+        } else {
+            // Inherit coupling state from previous block
+            if eac_bsi.cplinu[blk] {
+                ab.cplinu = true;
             }
         }
 
@@ -1578,35 +1595,101 @@ impl Ac3Decoder {
             }
         }
 
-        // 9. Bit allocation — use BSI-level params
+        // 9. Bit allocation params (conditional on bit_allocation_syntax)
+        if eac_bsi.bit_allocation_syntax {
+            // Same as AC-3: baie flag + BA params per block
+            let baie = if blk == 0 { true } else { br.read_bool() };
+            if baie {
+                ab.sdcycod = br.read(2) as usize;
+                ab.fdcycod = br.read(2) as usize;
+                ab.sgaincod = br.read(2) as usize;
+                ab.dbpbcod = br.read(2) as usize;
+                ab.floorcod = br.read(3) as usize;
+            }
+        } else if blk == 0 {
+            // Defaults from FFmpeg (when bit_allocation_syntax = 0)
+            ab.sdcycod = 2;
+            ab.fdcycod = 1;
+            ab.sgaincod = 1;
+            ab.dbpbcod = 2;
+            ab.floorcod = 7;
+        }
+
         let ba_params = BaParams {
-            sdecay: SLOW_DECAY[eac_bsi.sdcycod.min(3)] as i32,
-            fdecay: FAST_DECAY[eac_bsi.fdcycod.min(3)] as i32,
-            sgain: SLOW_GAIN[eac_bsi.sgaincod.min(3)] as i32,
-            dbknee: DB_PER_BIT[eac_bsi.dbpbcod.min(3)] as i32,
-            floor: FLOOR[eac_bsi.floorcod.min(7)] as i32,
+            sdecay: SLOW_DECAY[ab.sdcycod.min(3)] as i32,
+            fdecay: FAST_DECAY[ab.fdcycod.min(3)] as i32,
+            sgain: SLOW_GAIN[ab.sgaincod.min(3)] as i32,
+            dbknee: DB_PER_BIT[ab.dbpbcod.min(3)] as i32,
+            floor: FLOOR[ab.floorcod.min(7)] as i32,
         };
 
-        // Delta bit allocation (per block, in bitstream)
-        let deltbaie = br.read_bool();
-        if deltbaie {
-            if ab.cplinu { ab.cpldeltbae = br.read(2) as u8; }
-            for ch in 0..nfchans.min(MAX_CHANNELS) {
-                ab.deltbae[ch] = br.read(2) as u8;
+        // 9b. SNR offset (conditional on snr_offset_strategy)
+        // Strategy 0: frame-level (already in eac_bsi.snr_offset)
+        // Strategy 1-3: per-block in audio block (like AC-3)
+        let mut snroffset_all = eac_bsi.snr_offset;
+        let mut fgain_all = FAST_GAIN[4] as i32; // default
+        if eac_bsi.snr_offset_strategy != 0 {
+            // Read SNR offset from audio block
+            let snroffste = if blk == 0 { true } else { br.read_bool() };
+            if snroffste {
+                let csnroffst = (br.read(6) as i32 - 15) << 4;
+                // Per-channel SNR offsets — read and use for all
+                // For simplicity, use the first channel's offset for all
+                let snroffst = br.read(4) as i32;
+                snroffset_all = (csnroffst + snroffst) << 2;
+                // Skip remaining per-channel fine offsets
+                for _ch in 1..nfchans {
+                    br.skip(4); // fsnroffst
+                }
             }
+        }
 
-            if ab.cplinu && ab.cpldeltbae == 1 {
-                let _nseg = br.read(3) as usize;
-                // Note: coupling delta BA segments not stored for simplicity
+        // 9c. Fast gain (conditional on fast_gain_syntax)
+        if eac_bsi.fast_gain_syntax {
+            let fgaine = if blk == 0 { true } else { br.read_bool() };
+            if fgaine {
+                for _ch in 0..nfchans.min(MAX_CHANNELS) {
+                    let _fgaincod = br.read(3);
+                }
+                fgain_all = FAST_GAIN[4] as i32; // use default for now
             }
-            for ch in 0..nfchans.min(MAX_CHANNELS) {
-                if ab.deltbae[ch] == 1 {
-                    ab.deltnseg[ch] = (br.read(3) as usize).min(7);
-                    for seg in 0..=ab.deltnseg[ch] {
-                        ab.deltoffst[ch][seg] = br.read(5) as usize;
-                        ab.deltlen[ch][seg] = br.read(4) as usize;
-                        ab.deltba[ch][seg] = br.read(3) as usize;
+        }
+
+        // 9d. Coupling leak info
+        if ab.cplinu {
+            let cplleake = if blk == 0 { true } else { br.read_bool() };
+            if cplleake {
+                br.skip(3); // cplfleak
+                br.skip(3); // cplsleak
+            }
+        }
+
+        // 9e. Delta bit allocation (conditional on dba_syntax)
+        if eac_bsi.dba_syntax {
+            let deltbaie = br.read_bool();
+            if deltbaie {
+                if ab.cplinu { ab.cpldeltbae = br.read(2) as u8; }
+                for ch in 0..nfchans.min(MAX_CHANNELS) {
+                    ab.deltbae[ch] = br.read(2) as u8;
+                }
+
+                if ab.cplinu && ab.cpldeltbae == 1 {
+                    let _nseg = br.read(3) as usize;
+                }
+                for ch in 0..nfchans.min(MAX_CHANNELS) {
+                    if ab.deltbae[ch] == 1 {
+                        ab.deltnseg[ch] = (br.read(3) as usize).min(7);
+                        for seg in 0..=ab.deltnseg[ch] {
+                            ab.deltoffst[ch][seg] = br.read(5) as usize;
+                            ab.deltlen[ch][seg] = br.read(4) as usize;
+                            ab.deltba[ch][seg] = br.read(3) as usize;
+                        }
                     }
+                }
+            } else if blk == 0 {
+                ab.cpldeltbae = 2;
+                for ch in 0..nfchans.min(MAX_CHANNELS) {
+                    ab.deltbae[ch] = 2;
                 }
             }
         } else if blk == 0 {
@@ -1616,11 +1699,8 @@ impl Ac3Decoder {
             }
         }
 
-        // Run BA for each channel (using BSI SNR offsets)
+        // Run BA for each channel
         for ch in 0..nfchans.min(MAX_CHANNELS) {
-            let snroffset = (((eac_bsi.csnroffst - 15) << 4) + eac_bsi.fsnroffst[ch]) << 2;
-            let fgain = FAST_GAIN[eac_bsi.fgaincod[ch].min(7)] as i32;
-
             let delt = if ab.deltbae[ch] == 0 || ab.deltbae[ch] == 1 {
                 Some(DeltBAOwned {
                     nseg: ab.deltnseg[ch],
@@ -1636,46 +1716,42 @@ impl Ac3Decoder {
             bit_allocation(
                 eac_bsi.fscod, &ba_params,
                 ab.strtmant[ch], ab.endmant[ch],
-                &exps_copy, fgain, snroffset,
+                &exps_copy, fgain_all, snroffset_all,
                 0, 0, delt.as_ref(), &mut ab.baps[ch],
             );
         }
 
         // Coupling BA
         if ab.cplinu {
-            let snroffset = (((eac_bsi.csnroffst - 15) << 4) + eac_bsi.cplfsnroffst) << 2;
-            let fgain = FAST_GAIN[eac_bsi.cplfgaincod.min(7)] as i32;
-
             let mut exps_copy = [0u8; 256];
             exps_copy.copy_from_slice(&ab.cplexps);
 
             bit_allocation(
                 eac_bsi.fscod, &ba_params,
                 ab.cplstrtmant, ab.cplendmant,
-                &exps_copy, fgain, snroffset,
+                &exps_copy, fgain_all, snroffset_all,
                 0, 0, None, &mut ab.cplbap,
             );
         }
 
         // LFE BA
         if eac_bsi.lfeon {
-            let snroffset = (((eac_bsi.csnroffst - 15) << 4) + eac_bsi.lfefsnroffst) << 2;
-            let fgain = FAST_GAIN[eac_bsi.lfefgaincod.min(7)] as i32;
-
             let mut exps_copy = [0u8; 256];
             exps_copy.copy_from_slice(&ab.lfeexps);
 
             bit_allocation(
                 eac_bsi.fscod, &ba_params, 0, LFE_COEFS,
-                &exps_copy, fgain, snroffset,
+                &exps_copy, fgain_all, snroffset_all,
                 0, 0, None, &mut ab.lfebap,
             );
         }
 
-        // 10. Skip field
-        if br.read_bool() {
-            let skipl = br.read(9) as usize;
-            br.skip(skipl * 8);
+        // 10. Skip field (conditional on skip_syntax)
+        if eac_bsi.skip_syntax {
+            if br.read_bool() {
+                let skipl = br.read(9) as usize;
+                br.skip(skipl * 8);
+            }
         }
 
         // 11. Mantissas — identical to AC-3
@@ -2222,17 +2298,15 @@ mod tests {
         assert_eq!(eac.nfchans, 2);
         assert_eq!(eac.dialnorm, 31);
         assert_eq!(eac.bsmod, 0);
-        // Dither defaults to true
-        assert!(eac.dithflag[0][0]);
-        assert!(eac.dithflag[0][5]);
-        // Block switch defaults to false
-        assert!(!eac.blksw[0][0]);
+        // Syntax flags default to false
+        assert!(!eac.dither_flag_syntax);
+        assert!(!eac.block_switch_syntax);
         // Coupling defaults to false
         assert!(!eac.cplinu[0]);
         // SNR defaults
-        assert_eq!(eac.csnroffst, 0);
-        assert!(!eac.snroffste);
-        assert!(!eac.baie);
+        assert_eq!(eac.snr_offset, 0);
+        assert_eq!(eac.snr_offset_strategy, 0);
+        assert!(!eac.bit_allocation_syntax);
     }
 
     #[test]
