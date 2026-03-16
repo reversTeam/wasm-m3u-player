@@ -438,13 +438,51 @@ impl Ac3Decoder {
         })
     }
 
-    /// E-AC-3 (bsid 11-16) — not yet implemented.
-    /// E-AC-3 has a fundamentally different BSI and audio block structure from AC-3:
-    /// exponent strategies, coupling, SNR offsets etc. are all frame-level in the BSI,
-    /// not per-block. The AC-3 audio block parser cannot be reused.
-    /// Returns a descriptive error; the player will continue with video only.
-    fn decode_eac3_frame(&mut self, _frame_data: &[u8]) -> Result<DecodedFrame, DecodeError> {
-        Err(DecodeError::UnsupportedVersion(16))
+    /// Decode an E-AC-3 frame (bsid 11-16).
+    /// Parses the E-AC-3 BSI, then decodes each audio block and interleaves the output.
+    fn decode_eac3_frame(&mut self, frame_data: &[u8]) -> Result<DecodedFrame, DecodeError> {
+        let mut br = BitReader::new(frame_data);
+        let eac_bsi = self.parse_eac3_bsi(&mut br)?;
+
+        // Validate frame size
+        if frame_data.len() < eac_bsi.frmsize {
+            return Err(DecodeError::FrameTooShort);
+        }
+
+        // Skip dependent substreams for now (strmtyp=1)
+        if eac_bsi.strmtyp == 1 {
+            return Err(DecodeError::InvalidHeader("E-AC-3 dependent substream not supported".into()));
+        }
+
+        let total_channels = eac_bsi.nfchans + if eac_bsi.lfeon { 1 } else { 0 };
+        let num_blocks = eac_bsi.num_blocks;
+        let samples_per_channel = num_blocks * BLOCK_SAMPLES;
+
+        // Clear sample buffers
+        for ch in 0..total_channels {
+            self.samples[ch] = [0.0; AC3_FRAME_SAMPLES];
+        }
+
+        // Decode audio blocks
+        let mut audblk = AudioBlock::new();
+        for blk in 0..num_blocks {
+            self.read_eac3_audio_block(&mut br, &eac_bsi, &mut audblk, blk)?;
+        }
+
+        // Interleave output
+        let mut output = vec![0.0f32; samples_per_channel * total_channels];
+        for s in 0..samples_per_channel {
+            for ch in 0..total_channels {
+                output[s * total_channels + ch] = self.samples[ch][s];
+            }
+        }
+
+        Ok(DecodedFrame {
+            samples: output,
+            sample_rate: eac_bsi.sample_rate,
+            channels: total_channels as u32,
+            samples_per_channel,
+        })
     }
 
     /// Parse BSI — ported from ac3.js readBSI().
@@ -2245,5 +2283,16 @@ mod tests {
                 panic!("parse_eac3_bsi failed: {}", e);
             }
         }
+    }
+
+    #[test]
+    fn eac3_frame_too_short() {
+        let mut decoder = Ac3Decoder::new();
+        // Valid sync + E-AC-3 header but frame data truncated
+        let data = vec![0x0B, 0x77, 0x05, 0xFF, 0x3F, 0x85, 0x00, 0x00];
+        // This should parse BSI but fail with FrameTooShort since data is only 8 bytes
+        // but frmsize = 3072
+        let result = decoder.decode_frame(&data);
+        assert!(result.is_err());
     }
 }
