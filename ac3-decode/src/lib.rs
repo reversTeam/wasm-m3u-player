@@ -652,94 +652,15 @@ impl Ac3Decoder {
             if br.read_bool() { br.skip(8); } // compr2
         }
 
-        // Channel-dependent info
-        let mut _dmixmod = 0u8;
-        if eac.acmod >= 0x2 {
-            _dmixmod = br.read(2) as u8;
-        }
-        // Center mix level
-        if (eac.acmod & 0x1) != 0 && eac.acmod > 1 {
-            let _ltrtcmixlev = br.read(3);
-            let _lorocmixlev = br.read(3);
-        }
-        // Surround mix level
-        if (eac.acmod & 0x4) != 0 {
-            let _ltrtsurmixlev = br.read(3);
-            let _lorosurmixlev = br.read(3);
-        }
-
-        // LFE mix level
-        if eac.lfeon {
-            if br.read_bool() { // lfemixlevcode
-                br.skip(5); // lfemixlevcod
-            }
-        }
-
-        // Dependent stream info
-        if eac.strmtyp == 0 {
-            // Independent stream
-            if br.read_bool() { br.skip(8); } // pgmscle → pgmscl
-            if eac.acmod == 0 {
-                if br.read_bool() { br.skip(6); } // pgmscl2e → pgmscl2
-            }
-            if br.read_bool() { // extmixleve
-                br.skip(5); // extmixlev
-                if eac.acmod >= 0x2 {
-                    br.skip(3); // addmixleve stuff
-                    // Actually: extmixlev2 is different, let me handle more carefully
-                }
-                // Skip remaining extended mix info based on acmod
-                // The spec is complex here — simplify by parsing known fields
-            }
-        }
-
-        // Informational metadata
-        if eac.numblkscod == 0 {
-            br.skip(1); // blkid
-        }
-        if br.read_bool() { // infomdate
-            eac.bsmod = br.read(3) as u8;
-            br.skip(1); // copyrightb
-            br.skip(1); // origbs
-            if eac.acmod == 0x2 {
-                br.skip(2); // dsurmod
-                br.skip(2); // dheadphonmod
-            }
-            if eac.acmod >= 0x6 {
-                br.skip(2); // dsurexmod
-            }
-            // audprodie
-            if br.read_bool() {
-                br.skip(5); // mixlevel
-                br.skip(2); // roomtyp
-                br.skip(1); // adconvtyp
-            }
-            if eac.acmod == 0 {
-                // audprodi2e
-                if br.read_bool() {
-                    br.skip(5);
-                    br.skip(2);
-                    br.skip(1);
-                }
-            }
-            if eac.fscod < 3 {
-                br.skip(1); // sourcefscod
-            }
-        }
-
-        // Converter sync
-        if eac.strmtyp == 0 && eac.numblkscod != 3 {
-            br.skip(1); // convsync
-        }
-
-        // Dependent stream channel map
+        // ---- Correct order per ETSI TS 102 366, Table E.1 ----
+        // 1. chanmape (dependent stream only)
         if eac.strmtyp == 1 {
             if br.read_bool() { // chanmape
                 br.skip(16); // chanmap
             }
         }
 
-        // Mix metadata
+        // 2. mixmdate — mixing metadata
         if br.read_bool() { // mixmdate
             if eac.acmod > 0x2 {
                 br.skip(2); // dmixmod
@@ -773,7 +694,6 @@ impl Ac3Decoder {
                     3 => {
                         let mixdeflen = br.read(5) as usize;
                         br.skip((mixdeflen + 2) * 8); // skip variable-length mix data
-                        // Align not needed — data is bit-counted
                     }
                     _ => {}
                 }
@@ -804,7 +724,50 @@ impl Ac3Decoder {
             }
         }
 
-        // addbsie — additional BSI
+        // 3. infomdate — informational metadata
+        if br.read_bool() { // infomdate
+            eac.bsmod = br.read(3) as u8;
+            br.skip(1); // copyrightb
+            br.skip(1); // origbs
+            if eac.acmod == 0x2 {
+                br.skip(2); // dsurmod
+                br.skip(2); // dheadphonmod
+            }
+            if eac.acmod >= 0x6 {
+                br.skip(2); // dsurexmod
+            }
+            // audprodie
+            if br.read_bool() {
+                br.skip(5); // mixlevel
+                br.skip(2); // roomtyp
+                br.skip(1); // adconvtyp
+            }
+            if eac.acmod == 0 {
+                // audprodi2e
+                if br.read_bool() {
+                    br.skip(5);
+                    br.skip(2);
+                    br.skip(1);
+                }
+            }
+            if eac.fscod < 3 {
+                br.skip(1); // sourcefscod
+            }
+        }
+
+        // 4. convsync
+        if eac.strmtyp == 0 && eac.numblkscod != 3 {
+            br.skip(1); // convsync
+        }
+
+        // 5. blkid (dependent stream type 2 only)
+        if eac.strmtyp == 2 {
+            if br.read_bool() { // blkid
+                br.skip(6); // frmsizecod
+            }
+        }
+
+        // 6. addbsie — additional BSI
         if br.read_bool() {
             let addbsil = br.read(6) as usize;
             br.skip((addbsil + 1) * 8);
