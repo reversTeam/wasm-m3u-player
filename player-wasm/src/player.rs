@@ -1288,8 +1288,8 @@ impl Player {
     }
 
     /// Set audio volume (0.0 = muted, 1.0 = full).
-    pub fn set_volume(&self, volume: f64) {
-        self.audio_pipeline.set_volume(volume.clamp(0.0, 1.0));
+    pub fn set_volume(&mut self, volume: f32) {
+        self.audio_pipeline.set_volume(volume.clamp(0.0, 1.0) as f64);
     }
 
     /// Stop playback and reset.

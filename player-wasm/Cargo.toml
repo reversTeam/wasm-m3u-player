@@ -8,6 +8,7 @@ description = "WASM video player — headless API with WebCodecs + Canvas render
 wasm-opt = false
 
 [lib]
+name = "player"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
